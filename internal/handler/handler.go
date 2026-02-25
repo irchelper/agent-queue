@@ -1,0 +1,265 @@
+// Package handler implements the HTTP handler for agent-queue.
+package handler
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/irchelper/agent-queue/internal/model"
+	"github.com/irchelper/agent-queue/internal/notify"
+	"github.com/irchelper/agent-queue/internal/store"
+)
+
+// Handler holds shared dependencies for all HTTP handlers.
+type Handler struct {
+	store    *store.Store
+	notifier notify.Notifier
+	db       *sql.DB
+}
+
+// New creates a Handler and registers all routes on mux.
+func New(db *sql.DB, s *store.Store, n notify.Notifier) *Handler {
+	return &Handler{store: s, notifier: n, db: db}
+}
+
+// Register wires up all routes on mux.
+func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("/health", h.handleHealth)
+	mux.HandleFunc("/tasks", h.handleTasks)
+	mux.HandleFunc("/tasks/", h.handleTasksID)
+}
+
+// -------------------------------------------------------------------
+// F5: Health
+// -------------------------------------------------------------------
+
+func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	dbStatus := "ok"
+	if err := h.db.Ping(); err != nil {
+		dbStatus = "error: " + err.Error()
+	}
+	writeJSON(w, http.StatusOK, model.HealthResponse{Status: "ok", Database: dbStatus})
+}
+
+// -------------------------------------------------------------------
+// F1: /tasks
+// -------------------------------------------------------------------
+
+func (h *Handler) handleTasks(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.listTasks(w, r)
+	case http.MethodPost:
+		h.createTask(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	status := q.Get("status")
+	assignedTo := q.Get("assigned_to")
+	parentID := q.Get("parent_id")
+
+	var depsMetFilter *bool
+	if dm := q.Get("deps_met"); dm != "" {
+		b := dm == "true"
+		depsMetFilter = &b
+	}
+
+	tasks, err := h.store.ListTasks(status, assignedTo, parentID, depsMetFilter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks, "count": len(tasks)})
+}
+
+func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
+	var req model.CreateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		writeError(w, http.StatusBadRequest, "title is required")
+		return
+	}
+	task, err := h.store.CreateTask(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, task)
+}
+
+// -------------------------------------------------------------------
+// F1/F2/F3: /tasks/:id  and  /tasks/:id/claim  and  /tasks/:id/deps-met
+// -------------------------------------------------------------------
+
+func (h *Handler) handleTasksID(w http.ResponseWriter, r *http.Request) {
+	// Parse the path segments after "/tasks/"
+	path := strings.TrimPrefix(r.URL.Path, "/tasks/")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "missing task id")
+		return
+	}
+
+	parts := strings.SplitN(path, "/", 2)
+	id := parts[0]
+	var sub string
+	if len(parts) == 2 {
+		sub = parts[1]
+	}
+
+	switch sub {
+	case "":
+		switch r.Method {
+		case http.MethodGet:
+			h.getTask(w, r, id)
+		case http.MethodPatch:
+			h.patchTask(w, r, id)
+		case http.MethodDelete:
+			h.deleteTask(w, r, id)
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	case "claim":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.claimTask(w, r, id)
+	case "deps-met":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.depsMetTask(w, r, id)
+	default:
+		writeError(w, http.StatusNotFound, "unknown sub-resource: "+sub)
+	}
+}
+
+func (h *Handler) getTask(w http.ResponseWriter, _ *http.Request, id string) {
+	task, err := h.store.GetByID(id)
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
+func (h *Handler) patchTask(w http.ResponseWriter, r *http.Request, id string) {
+	var req model.PatchTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Version == 0 {
+		writeError(w, http.StatusBadRequest, "version is required")
+		return
+	}
+
+	task, triggered, err := h.store.PatchTask(id, req)
+	if err != nil {
+		var ve *store.ValidationError
+		if errors.As(err, &ve) {
+			writeError(w, http.StatusUnprocessableEntity, ve.Error())
+			return
+		}
+		handleStoreError(w, err)
+		return
+	}
+
+	// F6: async webhook on done.
+	if task.Status == model.StatusDone {
+		notify.AsyncNotify(h.notifier, task)
+	}
+
+	writeJSON(w, http.StatusOK, model.PatchTaskResponse{Task: task, Triggered: triggered})
+}
+
+func (h *Handler) deleteTask(w http.ResponseWriter, _ *http.Request, id string) {
+	if err := h.store.DeleteTask(id); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// F2
+func (h *Handler) claimTask(w http.ResponseWriter, r *http.Request, id string) {
+	var req model.ClaimRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Version == 0 {
+		writeError(w, http.StatusBadRequest, "version is required")
+		return
+	}
+	if strings.TrimSpace(req.Agent) == "" {
+		writeError(w, http.StatusBadRequest, "agent is required")
+		return
+	}
+
+	task, err := h.store.Claim(id, req.Version, req.Agent)
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
+// F3
+func (h *Handler) depsMetTask(w http.ResponseWriter, _ *http.Request, id string) {
+	// Verify task exists.
+	if _, err := h.store.GetByID(id); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	met, err := h.store.DepsMet(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, model.DepsMet{TaskID: id, DepsMet: met})
+}
+
+// -------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------
+
+func handleStoreError(w http.ResponseWriter, err error) {
+	switch {
+	case store.IsNotFound(err):
+		writeError(w, http.StatusNotFound, err.Error())
+	case store.IsConflict(err):
+		writeError(w, http.StatusConflict, "version conflict or task already claimed")
+	default:
+		log.Printf("[handler] internal error: %v", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("[handler] encode response: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, model.ErrorResponse{Error: msg})
+}
