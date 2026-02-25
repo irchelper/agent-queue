@@ -21,7 +21,7 @@ import (
 func main() {
 	var (
 		port   = flag.String("port", envOr("AGENT_QUEUE_PORT", "19827"), "listen port")
-		dbPath = flag.String("db", "data/queue.db", "path to SQLite database file")
+		dbPath = flag.String("db", envOr("AGENT_QUEUE_DB_PATH", "data/queue.db"), "path to SQLite database file")
 	)
 	flag.Parse()
 

@@ -3,7 +3,7 @@
 > Status: Draft → v5
 > Owner: 产品经理
 > Date: 2026-02-25
-> Updated: 2026-02-25 (v6 — 新增 F12 retry_assigned_to 自动退单机制；退单映射规范；异常处理独立章节写入 ARCH.md)
+> Updated: 2026-02-25 (v7 — F11 SessionNotifier 极简消息格式规范；新增 F13 db持久化防误删（AGENT_QUEUE_DB_PATH + Makefile clean规范）；专家汇报 Phase 2 全切说明)
 
 ---
 
@@ -368,12 +368,24 @@ type Notifier interface {
 | SessionNotifier | 任务 failed 时调用 `/tools/invoke sessions_send` 唤醒 CEO session | P0 |
 | CEO 重试 | CEO 收到通知后 PATCH status=pending（可选 retry_assigned_to）恢复任务 | P0 |
 
+**SessionNotifier 消息格式规范（极简模式）：**
+
+```
+新任务通知：[agent-queue] 你有新的待处理任务。请执行 poll 流程认领。
+失败通知：[agent-queue] ❌ 任务失败需介入：{title}
+result: {result}
+task_id: {id}
+```
+
+**设计原则：** 不含任务 title/description，避免 LLM 将通知误解为直接任务指令。专家被唤醒后，SOUL.md 的 poll 流程自动 `GET /tasks/poll` → claim → 读 description → 执行。SessionNotifier 仅发给需要知道的 1 个 session，不广播。
+
 **验收标准：**
-- [ ] 专家 `PATCH failed + failure_reason` 后，Go server 自动触发 SessionNotifier 唤醒 CEO
-- [ ] CEO session 收到包含 task_id + failure_reason 的结构化通知
+- [ ] 专家 `PATCH failed + result` 后，Go server 自动触发 SessionNotifier 唤醒 CEO
+- [ ] CEO session 收到极简通知（含 task_id + result），格式符合上述规范
 - [ ] CEO `PATCH failed→pending`（含 retry_assigned_to）后任务重回可认领池
 - [ ] 正常 `done` 流程不触发 SessionNotifier（CEO 零干扰验证）
-- [ ] SessionNotifier 失败时降级为 Discord webhook 兜底通知，不阻塞状态变更
+- [ ] `/dispatch` 发出的新任务通知消息不含 title，只有极简唤醒文本
+- [ ] SessionNotifier 仅发 1 个目标 session（不广播）
 
 ### F12: retry_assigned_to 自动退单机制
 
@@ -414,6 +426,25 @@ type Notifier interface {
 - [ ] PATCH failed + result 无 `retry_assigned_to` → 触发 SessionNotifier 唤醒 CEO
 - [ ] 自动建的 retry 任务可被目标专家通过 `GET /tasks/poll` 正常认领
 - [ ] 退单不影响原任务的 failed 终态（原任务保持 failed，不自动重置）
+
+### F13: 数据库持久化防误删
+
+| 功能 | 描述 | 优先级 |
+|------|------|--------|
+| `AGENT_QUEUE_DB_PATH` 环境变量 | 覆盖默认 db 路径，支持绝对路径配置，防止 WorkingDirectory 变动导致找不到 db | P0 |
+| Makefile clean 规范 | `make clean` 只删二进制；`make clean-all` 才删 db（需显式操作） | P0 |
+| launchd 环境变量 | plist 中配置 `AGENT_QUEUE_DB_PATH` 为绝对路径，确保服务重启路径不变 | P0 |
+
+**防误删规范：**
+- `make clean`：`rm -f agent-queue`（仅删二进制，安全）
+- `make clean-all`：`rm -f agent-queue data/queue.db`（清空所有数据，需显式调用）
+- 开发迭代禁用 `make clean-all`，避免丢失任务历史
+
+**验收标准：**
+- [ ] `AGENT_QUEUE_DB_PATH` 环境变量生效（优先级高于 `--db` 默认值）
+- [ ] `make clean` 后 `data/queue.db` 仍存在
+- [ ] `make clean-all` 后 db 才被删除
+- [ ] launchd plist 含 `AGENT_QUEUE_DB_PATH` 绝对路径配置
 
 ---
 

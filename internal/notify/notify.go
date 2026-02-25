@@ -65,6 +65,9 @@ func (d *DiscordNotifier) Notify(task model.Task) error {
 
 func (d *DiscordNotifier) send(task model.Task) error {
 	content := FormatMessage(task, d.userID, time.Now())
+	if task.Status == model.StatusFailed {
+		content = FormatFailedMessage(task, d.userID, time.Now())
+	}
 
 	body, err := json.Marshal(map[string]string{"content": content})
 	if err != nil {
@@ -107,6 +110,35 @@ func FormatMessage(task model.Task, userID string, doneAt time.Time) string {
 	return fmt.Sprintf(
 		"%s✅ 任务完成\n**任务：** %s\n**专家：** %s\n**耗时：** %s\n**结果：** %s\n`task_id: %s`",
 		mention, task.Title, expert, duration, result, task.ID,
+	)
+}
+
+// FormatFailedMessage builds the Discord notification content for a failed task.
+// Per docs/ARCH.md F6.
+func FormatFailedMessage(task model.Task, userID string, doneAt time.Time) string {
+	mention := ""
+	if userID != "" {
+		mention = fmt.Sprintf("<@%s> ", userID)
+	}
+
+	expert := task.AssignedTo
+	if expert == "" {
+		expert = "未知"
+	}
+
+	reason := task.FailureReason
+	if reason == "" {
+		reason = task.Result
+	}
+	if reason == "" {
+		reason = "（无）"
+	}
+
+	duration := FormatDuration(task.StartedAt, doneAt)
+
+	return fmt.Sprintf(
+		"%s❌ 任务失败\n**任务：** %s\n**专家：** %s\n**耗时：** %s\n**失败原因：** %s\n`task_id: %s`",
+		mention, task.Title, expert, duration, reason, task.ID,
 	)
 }
 

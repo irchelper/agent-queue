@@ -1,4 +1,4 @@
-.PHONY: build test run vet clean
+.PHONY: build test run vet clean clean-all
 
 BIN := agent-queue
 
@@ -15,4 +15,7 @@ vet:
 	go vet ./...
 
 clean:
+	rm -f $(BIN)
+
+clean-all:
 	rm -f $(BIN) data/queue.db

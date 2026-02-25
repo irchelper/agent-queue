@@ -748,12 +748,12 @@ func TestFailed_NoRetryDirective_NoNewTask(t *testing.T) {
 	// CEO should have been notified.
 	found := false
 	for _, msg := range ceoMessages {
-		if strings.Contains(msg, "⚠️") && strings.Contains(msg, "重要任务") {
+		if strings.Contains(msg, "❌") && strings.Contains(msg, "重要任务") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("CEO should have received ⚠️ alert for failed task, got: %v", ceoMessages)
+		t.Errorf("CEO should have received ❌ alert for failed task, got: %v", ceoMessages)
 	}
 }
 

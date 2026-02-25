@@ -114,26 +114,59 @@ failed  → pending                              （CEO 决策后重试）
 
 ### F6：Webhook 通知 + SessionNotifier
 
+**核心原则：专家只做 `PATCH /tasks`，Go server webhook 是唯一通知通道。专家不再 sessions_send CEO。**
+
 **两类通知，触发时机不同：**
 
 | 事件 | 通知方式 | 接收方 |
 |------|---------|--------|
 | 任务 `done` | Discord Incoming Webhook（`DiscordNotifier`） | 用户（@mention） |
-| 任务 `failed` | SessionNotifier（`/tools/invoke sessions_send`） | CEO session |
+| 任务 `failed` | Discord Incoming Webhook（`DiscordNotifier`） + SessionNotifier（CEO session） | 用户 + CEO |
 
 **done 通知（DiscordNotifier）：**
 - 异步 POST Discord Incoming Webhook
-- 通知格式：`@用户ID ✅ 任务完成：[task title] (task_id: xxx)`
 - 环境变量：`AGENT_QUEUE_DISCORD_WEBHOOK_URL`（未配置时 no-op + log.Info）
 - 失败处理：重试 1 次，最终失败记 error log，不阻塞状态变更
 
-**failed 通知（SessionNotifier）：**
-- 任务状态变为 `failed` 时，调用 OpenClaw `/tools/invoke` 触发 CEO session
-- 通知内容包含：task_id、title、failure_reason、assigned_to
-- 环境变量：`AGENT_QUEUE_OPENCLAW_API_URL` + `AGENT_QUEUE_OPENCLAW_API_KEY`（复用 /dispatch 配置）
-- 失败处理：重试 1 次，最终失败记 error log + Discord webhook 兜底通知
+**done 通知格式（Discord webhook → 用户）：**
+```
+<@用户ID> ✅ 任务完成
+**任务：** {title}
+**专家：** {assigned_to}
+**耗时：** {duration}
+**结果：** {result}
+`task_id: {id}`
+```
 
-**设计意图：** 正常路径（done）CEO 不被唤醒，实现零干扰。异常路径（failed）精确唤醒 CEO，由 LLM 判断如何处理（重试/改派/取消）。不使用 Discord webhook 通知 CEO 是因为 CEO 需要结构化数据（task_id、failure_reason）才能决策，而 Discord 消息是非结构化的。
+**failed 通知（Discord webhook → 用户 + SessionNotifier → CEO）：**
+- Discord webhook：同步用户感知，格式如下
+- SessionNotifier：精确唤醒 CEO session，仅发给需要知道的 1 个 session，不广播
+- 环境变量复用：`AGENT_QUEUE_OPENCLAW_API_URL` + `AGENT_QUEUE_OPENCLAW_API_KEY`
+
+**failed 通知格式（Discord webhook → 用户）：**
+```
+<@用户ID> ❌ 任务失败
+**任务：** {title}
+**专家：** {assigned_to}
+**耗时：** {duration}
+**失败原因：** {result}
+**下游受影响：** {blocked_downstream 列表或"无"}
+`task_id: {id}`
+```
+
+**SessionNotifier 消息格式（→ CEO session，极简，防 LLM 误解）：**
+```
+[agent-queue] ❌ 任务失败需介入：{title}
+result: {result}
+task_id: {id}
+```
+
+**专家汇报链路（Phase 2 全切）：**
+
+| 场景 | 操作 | 说明 |
+|------|------|------|
+| 有 task_id（agent-queue 任务） | PATCH /tasks（status=done/failed + result） | webhook 自动通知，专家无需 sessions_send |
+| 无 task_id（旧式派发兜底） | sessions_send CEO | 防极端情况静默，保留 fallback |
 
 **Notifier 接口扩展：**
 ```go
@@ -141,10 +174,13 @@ type Notifier interface {
     Notify(task Task) error
 }
 
-// DiscordNotifier: done 时推送给用户
-// SessionNotifier: failed 时唤醒 CEO session
+// DiscordNotifier: done/failed 时推送给用户（Discord Incoming Webhook）
+// SessionNotifier: failed 时精确唤醒 CEO session（OpenClaw /tools/invoke sessions_send）
 // 两者均实现 Notifier 接口，Go server 根据状态选择对应实现
+// 环境变量未配置时为 no-op（不报错，不发送，仅 log.Info）
 ```
+
+**设计意图：** 正常路径（done）CEO 零干扰。异常路径（failed）Discord 通知用户 + SessionNotifier 精确唤醒 CEO，CEO 收到结构化数据（task_id + failure_reason）后决策。SessionNotifier 仅发给 1 个目标 session，不广播。
 
 ### F7：POST /dispatch（原子化派发）
 
@@ -483,12 +519,66 @@ fi
 
 **兜底：** 无 task_id 时（旧式 sessions_send 派发），仍需 sessions_send CEO，防止沉默。
 
-### 过渡方案（两阶段）
+### 当前状态：Phase 2（全切）
 
-| 阶段 | 模式 | 切换条件 |
-|------|------|---------|
-| Phase 1 | `PATCH /tasks` + `sessions_send` 双写 | webhook 连续 7 天无漏发 |
-| Phase 2 | 纯 `PATCH /tasks` | 删除 sessions_send 相关代码 |
+专家汇报已全切至 `PATCH /tasks`，sessions_send 仅保留无 task_id 时的兜底 fallback。
+
+| 阶段 | 模式 | 状态 |
+|------|------|------|
+| Phase 1 | `PATCH /tasks` + `sessions_send` 双写 | ✅ 已完成（过渡期） |
+| **Phase 2** | **纯 `PATCH /tasks`** | **✅ 当前状态** |
+
+---
+
+## 数据持久化
+
+### SQLite WAL 模式
+
+已配置 `PRAGMA journal_mode=WAL`（`internal/db/db.go`），支持并发读写，单文件零部署。✅ 无需额外配置。
+
+### 数据库路径配置
+
+**默认路径：** `data/queue.db`（相对于 WorkingDirectory）
+
+**推荐：通过环境变量固定绝对路径，避免因 WorkingDirectory 变动导致 db 找不到：**
+
+```bash
+# 命令行参数
+./agent-queue --db /Users/kangxi/clawd/agent-queue/data/queue.db
+
+# 或通过环境变量（在 cmd/server/main.go 中通过 AGENT_QUEUE_DB_PATH 读取）
+export AGENT_QUEUE_DB_PATH=/Users/kangxi/clawd/agent-queue/data/queue.db
+```
+
+**launchd plist 配置（推荐）：**
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>AGENT_QUEUE_DB_PATH</key>
+  <string>/Users/kangxi/clawd/agent-queue/data/queue.db</string>
+</dict>
+```
+
+### Makefile clean 规范
+
+**⚠️ 重要：** `make clean` 只删二进制，不删数据库。开发迭代时避免 `make clean-all`，否则会清空所有任务历史。
+
+```makefile
+clean:       # 只删二进制（安全）
+    rm -f agent-queue
+
+clean-all:   # 删二进制 + 数据库（危险，会清空所有任务）
+    rm -f agent-queue data/queue.db
+```
+
+### 重要约束
+
+**⚠️ 不应在任务生命周期内重启 server。** 重启期间：
+- 进行中的任务仍持久化在 SQLite（不丢失）
+- 但 in_progress 任务的 assigned_to 不自动清空，需等超时检测 cron 释放
+- task_id 在 SQLite 中永久存在，重启不影响 ID 有效性
+
+**迁移：** 使用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 模式，schema 变更不删现有数据，server 重启自动应用。
 
 ---
 

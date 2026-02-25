@@ -114,8 +114,7 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		resp.NotifyError = fmt.Sprintf("unknown agent %q – task created but no session_send sent", req.AssignedTo)
 		log.Printf("[dispatch] unknown agent %q – skipping sessions_send", req.AssignedTo)
 	} else if h.oc != nil {
-		msg := fmt.Sprintf("[agent-queue] 新任务派发：%s\ntask_id: %s\n\n请通过 POST /tasks/%s/claim 认领后执行。",
-			task.Title, task.ID, task.ID)
+		msg := "[agent-queue] 你有新的待处理任务。请执行 poll 流程认领。"
 		if err = h.oc.SendToSession(sessionKey, msg); err != nil {
 			resp.NotifyError = err.Error()
 			log.Printf("[dispatch] sessions_send to %s failed: %v", sessionKey, err)
@@ -193,8 +192,7 @@ func (h *Handler) handleDispatchChain(w http.ResponseWriter, r *http.Request) {
 		resp.NotifyError = fmt.Sprintf("unknown agent %q – chain created but no session_send sent", first.AssignedTo)
 		log.Printf("[dispatch/chain] unknown agent %q – skipping sessions_send", first.AssignedTo)
 	} else if h.oc != nil {
-		msg := fmt.Sprintf("[agent-queue] 新任务派发：%s\ntask_id: %s\n\n请通过 POST /tasks/%s/claim 认领后执行。",
-			first.Title, first.ID, first.ID)
+		msg := "[agent-queue] 你有新的待处理任务。请执行 poll 流程认领。"
 		if err := h.oc.SendToSession(sessionKey, msg); err != nil {
 			resp.NotifyError = err.Error()
 			log.Printf("[dispatch/chain] sessions_send to %s failed: %v", sessionKey, err)
@@ -356,16 +354,15 @@ func (h *Handler) patchTask(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	// F6: async webhook on done.
+	// F6: async notification.
+	// done → Discord webhook (user @mention).
+	// failed → Discord webhook (user) + SessionNotifier (CEO session).
 	if task.Status == model.StatusDone {
 		notify.AsyncNotify(h.notifier, task)
 	}
-
-	// On failed: parse result for retry_assigned_to directive.
-	// Has directive → create retry task + dispatch to agent.
-	// No directive  → notify CEO via SessionNotifier (human intervention needed).
 	if task.Status == model.StatusFailed {
-		h.handleFailedTask(task)
+		notify.AsyncNotify(h.notifier, task) // Discord webhook to user
+		h.handleFailedTask(task)             // SessionNotifier to CEO (if no auto-retry)
 	}
 
 	writeJSON(w, http.StatusOK, model.PatchTaskResponse{Task: task, Triggered: triggered})
@@ -429,8 +426,7 @@ func (h *Handler) autoRetry(original model.Task, retryAgent string) {
 	if h.oc == nil {
 		return
 	}
-	msg := fmt.Sprintf("[agent-queue] 新任务派发：%s\ntask_id: %s\n\n请通过 POST /tasks/%s/claim 认领后执行。",
-		newTask.Title, newTask.ID, newTask.ID)
+	msg := "[agent-queue] 你有新的待处理任务。请执行 poll 流程认领。"
 	if err := h.oc.SendToSession(sessionKey, msg); err != nil {
 		log.Printf("[handler] autoRetry dispatch to %s failed: %v", sessionKey, err)
 	} else {

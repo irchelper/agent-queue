@@ -40,8 +40,8 @@ func TestSessionNotifier_OnFailed_SendsAlert(t *testing.T) {
 		t.Fatalf("wrong sessionKey: %v", args["sessionKey"])
 	}
 	msg, _ := args["message"].(string)
-	if !strings.Contains(msg, "⚠️") {
-		t.Errorf("message should contain warning icon")
+	if !strings.Contains(msg, "❌") {
+		t.Errorf("message should contain failure icon")
 	}
 	if !strings.Contains(msg, "f001") {
 		t.Errorf("message should contain task_id")

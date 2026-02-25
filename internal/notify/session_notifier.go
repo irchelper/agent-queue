@@ -40,8 +40,8 @@ func (s *SessionNotifier) OnFailed(task model.Task) error {
 		reason = "（无）"
 	}
 	msg := fmt.Sprintf(
-		"⚠️ 任务失败：%s\ntask_id: %s\nassigned_to: %s\nfailure_reason: %s\n请检查并决定：重试 / 改派 / 取消",
-		task.Title, task.ID, task.AssignedTo, reason,
+		"[agent-queue] ❌ 任务失败需介入：%s\nresult: %s\ntask_id: %s",
+		task.Title, reason, task.ID,
 	)
 	if err := s.client.SendToSession(s.ceoSessionKey, msg); err != nil {
 		log.Printf("[session_notifier] OnFailed → %s failed: %v", s.ceoSessionKey, err)

@@ -37,6 +37,8 @@
         <string>http://localhost:18789</string>
         <key>AGENT_QUEUE_OPENCLAW_API_KEY</key>
         <string>1e575a589cefecefdf4cfe5bc6fdf56f60f75a540c8904e8</string>
+        <key>AGENT_QUEUE_DB_PATH</key>
+        <string>/Users/kangxi/clawd/agent-queue/data/queue.db</string>
     </dict>
 </dict>
 </plist>

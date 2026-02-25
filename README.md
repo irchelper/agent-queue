@@ -23,9 +23,9 @@ agent-queue moves task state out of agent memory and into SQLite. Any agent can 
 - **F1 — Task CRUD**: Create/query/update tasks with full lifecycle support
 - **F2 — Optimistic lock claim**: Atomic claim with `version` field; concurrent claim → 409 Conflict
 - **F3 — Dependency graph**: `depends_on` array; upstream `done` → downstream auto-unlocked
-- **F4 — 7-state machine**: `pending → claimed → in_progress → review → done / blocked / cancelled`
+- **F4 — 8-state machine**: `pending → claimed → in_progress → review → done / blocked / failed / cancelled`
 - **F5 — Health check**: `GET /health` returns service + database status
-- **F6 — Discord webhook**: Task `done` → async POST to Discord Incoming Webhook (via `Notifier` interface)
+- **F6 — Discord webhook**: Task `done`/`failed` → async POST to Discord Incoming Webhook; `failed` also triggers SessionNotifier → CEO (via `Notifier` interface)
 - **F7 — Atomic dispatch**: `POST /dispatch` creates task + triggers agent session in one call
 - **F8 — Summary panel**: `GET /tasks/summary` returns global counts + active task list
 - **F9 — Agent self-poll**: `GET /tasks/poll?assigned_to=X` returns the best available task for an agent (deps-aware, priority-sorted)
@@ -48,9 +48,10 @@ go build -o agent-queue .
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `AGENT_QUEUE_DISCORD_WEBHOOK_URL` | Discord Incoming Webhook URL for task completion notifications | No |
-| `AGENT_QUEUE_OPENCLAW_API_URL` | OpenClaw gateway URL for `/dispatch` (default: `http://localhost:18789`) | No |
-| `AGENT_QUEUE_OPENCLAW_API_KEY` | OpenClaw gateway token for `/dispatch` | No |
+| `AGENT_QUEUE_DISCORD_WEBHOOK_URL` | Discord Incoming Webhook URL for task completion/failure notifications | No |
+| `AGENT_QUEUE_OPENCLAW_API_URL` | OpenClaw gateway URL for `/dispatch` and SessionNotifier (default: `http://localhost:18789`) | No |
+| `AGENT_QUEUE_OPENCLAW_API_KEY` | OpenClaw gateway token for `/dispatch` and SessionNotifier | No |
+| `AGENT_QUEUE_DB_PATH` | Override default SQLite database path (recommended: absolute path to avoid WorkingDirectory issues) | No |
 
 ## API Reference
 
@@ -152,17 +153,22 @@ Add to `openclaw.json`:
 ## Development
 
 ```bash
-make test    # run all tests (with -race)
-make vet     # go vet
-make build   # compile
+make test      # run all tests (with -race)
+make vet       # go vet
+make build     # compile
+make clean     # remove binary only (safe — does NOT delete database)
+make clean-all # remove binary AND database (destructive — clears all task history)
 ```
+
+> **Note:** Never run `make clean-all` during active task execution — it will permanently delete all task records.
 
 ## Architecture
 
-- **Storage**: SQLite WAL mode — single file, zero deployment, ACID transactions
+- **Storage**: SQLite WAL mode — single file, zero deployment, ACID transactions; path configurable via `AGENT_QUEUE_DB_PATH`
 - **API**: Go `net/http`, no framework, ~350 lines
 - **Concurrency**: Optimistic locking via `version` field
-- **Notifications**: Discord Incoming Webhook via `Notifier` interface (platform-agnostic)
+- **Agent reporting**: Agents only `PATCH /tasks` — no `sessions_send` required. Go server webhook is the sole notification channel.
+- **Notifications**: Discord Incoming Webhook (`done`/`failed` → user) + SessionNotifier (`failed` → CEO session, minimal format to prevent LLM misinterpretation), via `Notifier` interface (platform-agnostic)
 - **Deployment**: launchd (macOS) / systemd (Linux), KeepAlive auto-restart
 
 Full architecture: [`docs/ARCH.md`](./docs/ARCH.md) | Product spec: [`docs/PRD.md`](./docs/PRD.md)
