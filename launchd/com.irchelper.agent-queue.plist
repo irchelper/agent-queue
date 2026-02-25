@@ -27,9 +27,9 @@
         <key>AGENT_QUEUE_PORT</key>
         <string>19827</string>
         <key>AGENT_QUEUE_DISCORD_WEBHOOK_URL</key>
-        <string></string>
+        <string>https://discord.com/api/webhooks/1476188831311986719/YtAzF3zHf7R6Ru6F3HVfrO5hLWVgGSCumZx0pTp0ErEJLFhkGuILAbJOoHW0Bgou7Iwo</string>
         <key>AGENT_QUEUE_DISCORD_USER_ID</key>
-        <string></string>
+        <string>1475329182878928937</string>
     </dict>
 </dict>
 </plist>
