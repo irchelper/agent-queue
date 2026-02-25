@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/irchelper/agent-queue/internal/model"
 	"github.com/irchelper/agent-queue/internal/notify"
@@ -73,13 +74,22 @@ func TestSessionNotifier_OnFailed_DefaultCEOKey(t *testing.T) {
 	}
 }
 
-func TestSessionNotifier_OnFailed_NetworkError_ReturnsErr(t *testing.T) {
-	// Point to a port that refuses connections.
+func TestSessionNotifier_OnFailed_NetworkError_EnqueuesRetry(t *testing.T) {
+	// V9: OnFailed uses RetryQueue — network errors are enqueued, not returned.
 	oc := openclaw.NewWithURL("http://127.0.0.1:1", "")
 	sn := notify.NewSessionNotifier(oc, "agent:ceo:test")
+	sn.Start()
+	defer sn.Stop()
 
-	err := sn.OnFailed(model.Task{ID: "e1", Status: model.StatusFailed})
-	if err == nil {
-		t.Fatal("expected error from unreachable server")
+	// OnFailed should always return nil (async retry).
+	err := sn.OnFailed(model.Task{ID: "e1", Title: "t", Status: model.StatusFailed})
+	if err != nil {
+		t.Fatalf("OnFailed should return nil (retry queued), got %v", err)
+	}
+
+	// The item should have been enqueued because the initial send failed.
+	time.Sleep(50 * time.Millisecond)
+	if sn.RetryQueueLen() == 0 {
+		t.Fatal("expected retry item to be queued after network failure")
 	}
 }

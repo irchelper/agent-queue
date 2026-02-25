@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/irchelper/agent-queue/internal/failparser"
@@ -20,11 +23,17 @@ import (
 
 // Handler holds shared dependencies for all HTTP handlers.
 type Handler struct {
-	store     *store.Store
-	notifier  notify.Notifier
-	sessionN  *notify.SessionNotifier // CEO alert for unhandled failures
-	oc        *openclaw.Client
-	db        *sql.DB
+	store    *store.Store
+	notifier notify.Notifier
+	sessionN *notify.SessionNotifier // CEO alert for unhandled failures
+	oc       *openclaw.Client
+	db       *sql.DB
+
+	// stale ticker fields
+	staleStop     chan struct{}
+	staleWG       sync.WaitGroup
+	staleInterval time.Duration
+	staleThreshold time.Duration
 }
 
 // New creates a Handler and registers all routes on mux.
@@ -34,12 +43,116 @@ func New(db *sql.DB, s *store.Store, n notify.Notifier, oc *openclaw.Client) *Ha
 		sn = notify.NewSessionNotifier(oc, "")
 	}
 	return &Handler{
-		store:    s,
-		notifier: n,
-		sessionN: sn,
-		oc:       oc,
-		db:       db,
+		store:          s,
+		notifier:       n,
+		sessionN:       sn,
+		oc:             oc,
+		db:             db,
+		staleStop:      make(chan struct{}),
+		staleInterval:  envDuration("AGENT_QUEUE_STALE_CHECK_INTERVAL", 10*time.Minute),
+		staleThreshold: envDuration("AGENT_QUEUE_STALE_THRESHOLD", 30*time.Minute),
 	}
+}
+
+// SetStaleThresholdForTesting overrides the stale threshold. Test use only.
+func (h *Handler) SetStaleThresholdForTesting(d time.Duration) { h.staleThreshold = d }
+
+// StartRetryQueue starts the SessionNotifier's internal retry queue goroutine.
+func (h *Handler) StartRetryQueue() {
+	if h.sessionN != nil {
+		h.sessionN.Start()
+		log.Println("[retry_queue] started")
+	}
+}
+
+// StopRetryQueue stops the SessionNotifier's retry queue goroutine.
+func (h *Handler) StopRetryQueue() {
+	if h.sessionN != nil {
+		h.sessionN.Stop()
+	}
+}
+
+// StartStaleTicker launches the background stale task re-dispatch goroutine.
+func (h *Handler) StartStaleTicker() {
+	if h.sessionN == nil {
+		log.Println("[stale_ticker] no SessionNotifier configured, stale ticker disabled")
+		return
+	}
+	h.staleWG.Add(1)
+	go h.runStaleTicker()
+	log.Printf("[stale_ticker] started: interval=%v threshold=%v", h.staleInterval, h.staleThreshold)
+}
+
+// StopStaleTicker signals the stale ticker goroutine to stop and waits.
+func (h *Handler) StopStaleTicker() {
+	close(h.staleStop)
+	h.staleWG.Wait()
+}
+
+// runStaleTicker is the background goroutine body.
+func (h *Handler) runStaleTicker() {
+	defer h.staleWG.Done()
+	ticker := time.NewTicker(h.staleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.staleStop:
+			return
+		case <-ticker.C:
+			h.checkStaleTasks()
+		}
+	}
+}
+
+// CheckStaleTasks is exported for testing. In production it is called by runStaleTicker.
+func (h *Handler) CheckStaleTasks() { h.checkStaleTasks() }
+
+// checkStaleTasks fetches stale pending tasks and re-dispatches them.
+func (h *Handler) checkStaleTasks() {
+	candidates, err := h.store.ListStaleCandidates(h.staleThreshold)
+	if err != nil {
+		log.Printf("[stale_ticker] ListStaleCandidates: %v", err)
+		return
+	}
+
+	// Post-filter: only tasks whose deps are met (inline deps check).
+	for _, c := range candidates {
+		met, err := h.store.DepsMet(c.ID)
+		if err != nil {
+			log.Printf("[stale_ticker] DepsMet(%s): %v", c.ID, err)
+			continue
+		}
+		if !met {
+			continue
+		}
+		// Re-dispatch: fire-and-forget sessions_send (Dispatch does not retry).
+		if _, ok := h.sessionN.Dispatch(c.AssignedTo); ok {
+			log.Printf("[stale_ticker] re-dispatched stale task %s (%s) to %s", c.ID, c.Title, c.AssignedTo)
+		}
+		// Reset the 30-min countdown regardless of dispatch success.
+		if err := h.store.TouchUpdatedAt(c.ID); err != nil {
+			log.Printf("[stale_ticker] TouchUpdatedAt(%s): %v", c.ID, err)
+		}
+	}
+}
+
+// envDuration reads an environment variable as a duration; falls back to def.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	// Accept plain seconds (e.g. "600") or Go duration strings (e.g. "10m").
+	if secs, err := strconv.Atoi(v); err == nil {
+		return time.Duration(secs) * time.Second
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Printf("[handler] invalid %s=%q, using default %v", key, v, def)
+		return def
+	}
+	return d
 }
 
 // Register wires up all routes on mux.

@@ -3,7 +3,7 @@
 > Status: Draft → v5
 > Owner: 产品经理
 > Date: 2026-02-25
-> Updated: 2026-02-26 (v10 — V8: 新增 F15 链路完成通知 CEO（notify_ceo_on_complete + chain_id）、F16 Go server retry 路由表（替代 SOUL.md 硬编码）; triggered 缺口修复说明)
+> Updated: 2026-02-26 (v11 — V9: 新增 F17 SessionNotifier 内存重试队列（CEO通知3次/30s-60s-120s backoff）、F18 stale任务自动re-dispatch（10min ticker/30min阈值）)
 
 ---
 
@@ -590,6 +590,75 @@ LIMIT 1
 **验收标准：**
 - [ ] 链 A→B→C，A PATCH done → B 的 assigned_to 专家 session 收到 SessionNotifier 唤醒消息
 - [ ] B 专家不需要等 startup 自驱 poll，会立即收到通知触发 poll
+
+### F17: SessionNotifier 内存重试队列（V9 新增）
+
+| 功能 | 描述 | 优先级 |
+|------|------|--------|
+| `RetryQueue` 内存队列 | 新增 `internal/notify/retry.go`，background goroutine 每 10s tick | P0 |
+| CEO 通知重试 | failed→CEO 和 chain_complete→CEO 通知失败时加入队列重试 | P0 |
+| 退避策略 | 30s → 60s → 120s，3 次后放弃并 log | P0 |
+| 范围限定 | dispatch/triggered → 专家 通知不重试（SQLite + stale ticker 兜底） | P0 |
+| server 重启行为 | 内存队列丢失（可接受）；launchd 秒级重启 + CEO startup 巡检补漏 | P0 |
+| 无 schema 变更 | 纯内存实现，无新增数据库列 | P0 |
+
+**核心约束（影响设计决策）：**
+> `sessions_send` 使用 `timeoutSeconds:0`（fire-and-forget），返回 `ok:true` 即使 session 不存在。无法区分"成功投递"和"静默丢失"。重试价值是"增加概率"，不是"保证投递"。
+
+**数据结构：**
+```go
+// internal/notify/retry.go
+type retryItem struct {
+    sendFunc  func() error  // 闭包，captures sessionKey + message
+    attempts  int
+    nextRetry time.Time
+    label     string         // "OnFailed:task_id" / "OnChainComplete:chain_id"
+}
+type RetryQueue struct { mu sync.Mutex; items []retryItem; stop chan struct{} }
+```
+
+**退避后处理：** 仅 log，不 Discord webhook 兜底（webhook 无法触发 CEO agent，兜底无意义）。
+
+**验收标准：**
+- [ ] `sessions_send` HTTP 报错时，OnFailed 通知加入重试队列
+- [ ] 30s 后第 1 次重试，60s 后第 2 次，120s 后第 3 次；第 3 次失败后 log 并丢弃
+- [ ] `sessions_send` 返回 `ok:true`（即使未真正投递）视为本次尝试成功，移出队列
+- [ ] dispatch/triggered → 专家 通知不走重试队列
+- [ ] server 重启后内存队列清空，不影响 SQLite 任务状态
+
+### F18: stale 任务自动 re-dispatch（V9 新增）
+
+| 功能 | 描述 | 优先级 |
+|------|------|--------|
+| stale ticker | Go server 内置 goroutine，`AGENT_QUEUE_STALE_CHECK_INTERVAL`（默认 10m）tick | P0 |
+| stale 定义 | `status=pending AND assigned_to != '' AND updated_at < now()-30min`（可配 `AGENT_QUEUE_STALE_THRESHOLD`，默认 30m） | P0 |
+| deps_met 过滤 | Go 层 post-filter：逐个调 `depsMetForID`（含 superseded_by 扩展），排除依赖未满足任务 | P0 |
+| re-dispatch | 命中 stale 条件 → `SessionNotifier.Dispatch(assignedTo)` 唤醒专家 | P0 |
+| TouchUpdatedAt | re-dispatch 后更新 `updated_at`，重置 30min 倒计时；**不改 `version`** | P0 |
+| 无新增 schema 列 | 不加 `notified` 列；"30min 没人 claim = stale"，无需区分原因 | P0 |
+| 可配置参数 | `AGENT_QUEUE_STALE_CHECK_INTERVAL`（默认 10m）+ `AGENT_QUEUE_STALE_THRESHOLD`（默认 30m） | P1 |
+
+**stale 查询 SQL：**
+```sql
+SELECT id, title, assigned_to FROM tasks
+WHERE status = 'pending'
+  AND assigned_to != ''
+  AND updated_at < datetime('now', ?)
+ORDER BY updated_at ASC
+LIMIT 20
+```
+
+**改动文件：**
+- `internal/store/store.go`：新增 `ListStaleCandidates` + `TouchUpdatedAt`（~20 行）
+- `internal/handler/handler.go`：新增 `checkStaleTasks` + `StartStaleTicker`（~40 行）
+- `cmd/server/main.go`：启动时调用 `StartStaleTicker`
+
+**验收标准：**
+- [ ] pending + assigned_to + 30min 无 claim 的任务，下一次 tick 时 re-dispatch
+- [ ] re-dispatch 后 `updated_at` 更新，不再出现在下一轮 stale 列表（直到又过 30min）
+- [ ] `version` 不变（专家 claim 时不受影响，无 409）
+- [ ] deps_met=false 的任务不触发 re-dispatch
+- [ ] `AGENT_QUEUE_STALE_CHECK_INTERVAL` / `AGENT_QUEUE_STALE_THRESHOLD` 环境变量生效
 
 ---
 

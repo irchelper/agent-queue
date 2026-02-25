@@ -46,6 +46,10 @@ func main() {
 	n := notify.NewFromEnv()
 	h := handler.New(database, s, n, oc)
 
+	// Start background services.
+	h.StartRetryQueue()  // V9: SessionNotifier internal retry queue
+	h.StartStaleTicker() // V9: stale task re-dispatch
+
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -71,6 +75,11 @@ func main() {
 
 	<-quit
 	log.Println("shutting down...")
+
+	// Stop background services before HTTP shutdown.
+	h.StopStaleTicker()
+	h.StopRetryQueue()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {

@@ -1263,3 +1263,160 @@ func TestPoll_WrongAgent_ReturnsNothing(t *testing.T) {
 		t.Fatalf("devops should not see coder's task, got %+v", pr.Task)
 	}
 }
+
+// -------------------------------------------------------------------
+// V9: StaleTicker re-dispatch
+// -------------------------------------------------------------------
+
+// newTestServerWithHandler creates a test server and returns both server and handler
+// for direct method access (e.g. CheckStaleTasks).
+func newTestServerWithHandler(t *testing.T, oc *openclaw.Client) (*httptest.Server, *handler.Handler) {
+	t.Helper()
+	f, err := os.CreateTemp("", "handler-stale-test-*.db")
+	if err != nil {
+		t.Fatalf("temp file: %v", err)
+	}
+	f.Close()
+	t.Cleanup(func() { os.Remove(f.Name()) })
+
+	database, err := db.Open(f.Name())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	s := store.New(database)
+	h := handler.New(database, s, notify.NoOp{}, oc)
+	mux := http.NewServeMux()
+	h.Register(mux)
+	return httptest.NewServer(mux), h
+}
+
+// TestV9_StaleTicker_ReDispatchesPendingTask verifies that CheckStaleTasks
+// re-dispatches a task whose updated_at is beyond the stale threshold.
+func TestV9_StaleTicker_ReDispatchesPendingTask(t *testing.T) {
+	var mu sync.Mutex
+	var dispatched []string
+
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if key, ok := args["sessionKey"].(string); ok {
+				mu.Lock()
+				dispatched = append(dispatched, key)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+
+	// Create a pending task for coder BEFORE setting threshold,
+	// so the task's updated_at is genuinely in the past by the time we check.
+	var task model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "stale-task", "assigned_to": "coder"})
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	// Wait briefly so updated_at is strictly before 'now'.
+	time.Sleep(50 * time.Millisecond)
+
+	// Set stale threshold to 1ms so the task (created 50ms ago) is immediately stale.
+	h.SetStaleThresholdForTesting(time.Millisecond)
+
+	// Clear any dispatch from task creation.
+	mu.Lock()
+	dispatched = nil
+	mu.Unlock()
+
+	// Trigger stale check directly (no waiting for 10min ticker).
+	h.CheckStaleTasks()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify coder session was re-dispatched.
+	coderKey := "agent:coder:discord:channel:1475338640593916045"
+	mu.Lock()
+	snap := make([]string, len(dispatched))
+	copy(snap, dispatched)
+	mu.Unlock()
+
+	found := false
+	for _, key := range snap {
+		if key == coderKey {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("stale ticker should have re-dispatched coder task, got: %v", snap)
+	}
+}
+
+// TestV9_StaleTicker_SkipsDepsPendingTasks verifies that tasks with unmet deps
+// are NOT re-dispatched by the stale ticker.
+func TestV9_StaleTicker_SkipsDepsPendingTasks(t *testing.T) {
+	var mu sync.Mutex
+	var dispatched []string
+
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if key, ok := args["sessionKey"].(string); ok {
+				mu.Lock()
+				dispatched = append(dispatched, key)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+
+	// Create A→B chain. B depends on A (not done).
+	chainResp := postJSON(t, srv, "/dispatch/chain", map[string]any{
+		"tasks": []map[string]any{
+			{"title": "stale-A", "assigned_to": "coder"},
+			{"title": "stale-B", "assigned_to": "writer"},
+		},
+	})
+	var cr model.ChainResponse
+	json.NewDecoder(chainResp.Body).Decode(&cr) //nolint:errcheck
+	chainResp.Body.Close()
+
+	taskB := cr.Tasks[1]
+
+	// Wait so tasks are genuinely stale (updated_at in the past).
+	time.Sleep(50 * time.Millisecond)
+
+	// Set stale threshold to 1ms.
+	h.SetStaleThresholdForTesting(time.Millisecond)
+
+	mu.Lock()
+	dispatched = nil
+	mu.Unlock()
+
+	h.CheckStaleTasks()
+	time.Sleep(50 * time.Millisecond)
+
+	// B should NOT be re-dispatched because its dep (A) is not done.
+	writerKey := "agent:writer:discord:channel:1475339585075548200"
+	mu.Lock()
+	snap := make([]string, len(dispatched))
+	copy(snap, dispatched)
+	mu.Unlock()
+
+	for _, key := range snap {
+		if key == writerKey {
+			t.Errorf("writer task %s should not be re-dispatched (deps not met), dispatched: %v", taskB.ID, snap)
+		}
+	}
+}

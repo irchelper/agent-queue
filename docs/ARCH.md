@@ -1,6 +1,6 @@
 # agent-queue 架构说明
 
-> 版本：v8 | 更新：2026-02-26 | 代码基线：commit `6d56b5d` + V8 chain通知+retry_routing+triggered修复
+> 版本：v9 | 更新：2026-02-26 | 代码基线：commit `a9dc0cd` + V9 SessionNotifier重试队列+stale任务巡检
 > 对应 PRD：`PRD.md`
 
 ---
@@ -338,9 +338,10 @@ GET http://localhost:19827/tasks?status=in_progress
 | 局限 | 影响 | 缓解措施 |
 |------|------|---------|
 | webhook 不触发 CEO agent | CEO 不自动感知 done | 不需要——串行链靠 Go server 推进，CEO 无需介入 |
-| sessions_send 丢失（target session 不在） | CEO 可能不知道 failed | CEO startup GET /tasks/summary + cron 巡检 /tasks?status=failed |
-| dispatch sessions_send 丢失 | 专家不知道有新任务 | 专家 startup poll + CEO cron 巡检长时间 pending 任务 |
-| Go server 宕机 | PATCH 404，专家 PATCH 失败 | launchd KeepAlive 自动重启（秒级恢复）；专家降级 sessions_send CEO |
+| sessions_send 无法检测投递失败（fire-and-forget，`timeoutSeconds:0` 永远返回 `ok:true`） | 无法区分"成功投递"和"session 不在静默丢失" | **V9 功能 B**：CEO 通知（failed/chain_complete）走内存重试队列（3次/30s-60s-120s）；**V9 功能 C**：stale ticker 兜底 |
+| sessions_send 目标 session 不在 | CEO 可能不知道 failed；专家可能不知道有新任务 | **V9 功能 B** 重试 CEO 通知；**V9 功能 C** stale ticker 10min 扫描，30min 无人 claim → 自动 re-dispatch |
+| dispatch sessions_send 丢失 | 专家不知道有新任务，任务长时间挂起 | **V9 功能 C** stale ticker：pending+deps_met+30min 无 claim → 自动 re-dispatch（替代原"CEO 手动重派"方案） |
+| Go server 宕机 | PATCH 404，专家 PATCH 失败；内存重试队列丢失 | launchd KeepAlive 自动重启（秒级恢复）；重启后 CEO startup 巡检 `GET /tasks/summary` 补漏；专家降级 sessions_send CEO |
 
 ---
 
@@ -569,13 +570,106 @@ INSERT INTO retry_routing (assigned_to, error_keyword, retry_assigned_to, priori
 
 ---
 
+## §7 SessionNotifier 可靠性机制（V9）
+
+### 核心约束：sessions_send 无法检测投递失败
+
+OpenClaw `/tools/invoke` 的 `sessions_send` 使用 `timeoutSeconds: 0`（fire-and-forget），返回 `ok: true` 即使目标 session 不存在。**调用方无法区分成功投递和 session 不在静默丢失。**
+
+这意味着：
+- "重试到成功"策略在协议层不可行——你永远不知道什么时候成功
+- 重试的价值是"增加概率"——session 可能在两次尝试之间被创建
+
+### 功能 B：内存重试队列（CEO 通知专用）
+
+**新增文件：** `internal/notify/retry.go`（~80 行）
+
+```go
+type retryItem struct {
+    sendFunc  func() error  // 闭包：captures sessionKey + message
+    attempts  int
+    nextRetry time.Time
+    label     string         // 日志用："OnFailed:task_id" / "OnChainComplete:chain_id"
+}
+
+type RetryQueue struct {
+    mu    sync.Mutex
+    items []retryItem
+    stop  chan struct{}
+}
+```
+
+**行为：**
+- `Enqueue(label, sendFunc)`：立即调用一次；若 HTTP 报错（非 ok），加入队列
+- background goroutine 每 10s tick，按退避策略重试
+- 退避：30s → 60s → 120s，第 3 次失败后放弃，仅 log
+
+**哪些通知走重试队列：**
+
+| 通知类型 | 重试 | 理由 |
+|---------|------|------|
+| failed → CEO | ✅ | CEO 必须感知，延迟=阻塞 |
+| chain_complete → CEO | ✅ | CEO 需要感知链路完成 |
+| dispatch → 专家 | ❌ | 任务在 SQLite，专家 startup poll 兜底；功能 C 再兜底 |
+| triggered → 下游专家 | ❌ | 同上 |
+
+**放弃后的兜底：** 3 次重试失败 = OpenClaw Gateway 大概率宕机；launchd 秒级重启后 CEO startup 巡检 `GET /tasks/summary` 补漏。不走 Discord webhook 兜底（webhook 无法触发 CEO agent，兜底无意义）。
+
+**server 重启丢失队列：** 可接受。launchd 秒级重启，SQLite 持久化是真正保底——任务状态不丢，CEO startup 巡检会发现 failed 并人工决策。
+
+### 功能 C：stale 任务巡检 ticker
+
+**改动文件：** `internal/store/store.go`（~20 行）+ `internal/handler/handler.go`（~40 行）+ `cmd/server/main.go`
+
+**stale 定义：**
+```sql
+-- store.ListStaleCandidates
+SELECT id, title, assigned_to FROM tasks
+WHERE status = 'pending'
+  AND assigned_to != ''
+  AND updated_at < datetime('now', ?)   -- ? = '-30 minutes'
+ORDER BY updated_at ASC
+LIMIT 20
+```
+
+Go 层 post-filter：逐个调 `depsMetForID`（含 V7 superseded_by 扩展），过滤依赖未满足的任务。
+
+**行为：**
+```
+StartStaleTicker(interval=10min):
+  每 10min tick → checkStaleTasks()
+    → ListStaleCandidates(30min) → post-filter deps_met
+    → for each stale task:
+        SessionNotifier.Dispatch(task.AssignedTo)   // re-dispatch
+        store.TouchUpdatedAt(task.ID)                // 重置 30min 倒计时
+```
+
+`TouchUpdatedAt`：`UPDATE tasks SET updated_at = ? WHERE id = ?`，**不改 version**（防影响乐观锁）。
+
+**参数可配置（环境变量）：**
+- `AGENT_QUEUE_STALE_CHECK_INTERVAL`（默认 10m）
+- `AGENT_QUEUE_STALE_THRESHOLD`（默认 30m）
+
+**与功能 B 的互补关系：**
+
+| 场景 | 功能 B | 功能 C |
+|------|-------|-------|
+| failed → CEO sessions_send HTTP 报错 | ✅ 30s/60s/120s 重试 | ❌ |
+| chain_complete → CEO HTTP 报错 | ✅ 重试 | ❌ |
+| dispatch/triggered → 专家 session 不在 | ❌ | ✅ 30min 后 re-dispatch |
+| 专家 session 不在（通用） | ❌ | ✅ 任务 pending 30min 无 claim → re-dispatch |
+
+功能 B 覆盖短时瞬态失败（秒级），功能 C 覆盖长时 session 缺失（分钟级）。
+
+---
+
 ## 技术选型
 
 | 层 | 选型 | 说明 |
 |----|------|------|
 | **存储** | SQLite（WAL 模式） | 单文件，零部署，ACID 事务，WAL 支持并发读写 |
-| **API 服务** | Go `net/http`（无框架） | 单二进制；handler ~540行 + store ~690行；V8 新增 retry_routing store + chain complete 检查 |
-| **通知** | Discord Incoming Webhook + OpenClaw sessions_send | 双通道：webhook=用户审计，sessions_send=agent感知 |
+| **API 服务** | Go `net/http`（无框架） | 单二进制；handler ~540行 + store ~690行；V8 retry_routing + V9 RetryQueue + stale ticker |
+| **通知** | Discord Incoming Webhook + OpenClaw sessions_send | 双通道：webhook=用户审计，sessions_send=agent感知；V9 内存重试队列提升 CEO 通知可靠性 |
 | **并发控制** | 乐观锁（`version` 字段） | `WHERE version = ? AND status = 'pending'` 原子更新 |
 | **部署** | launchd（macOS）/ systemd（Linux）| KeepAlive，进程崩溃自动重启 |
 
@@ -644,6 +738,10 @@ export AGENT_QUEUE_DB_PATH="/Users/kangxi/clawd/agent-queue/data/queue.db"
 - **[V8] 为什么 notify_ceo_on_complete 标记在每个任务而非只标记链尾：** autoRetry 可替换链中任意任务，如只标记链尾，retry 任务不继承标记；全链任务都标记后，任何任务 done 时统一检查 IsChainComplete，逻辑一致
 - **[V8] 为什么 retry_routing 在 SQLite 表而非 SOUL.md 硬编码：** SOUL.md 是 prompt 文件，修改退单规则需重部署 9 个专家；Go server 动态查表，在线 CRUD `/retry-routing`，无需重启；且从 SOUL.md 中删除 15-20 行映射规则，降低每次 session 的 context 成本
 - **[V8] triggered 缺口为何存在：** unlockDependents 早期设计只是"解锁依赖"，返回 triggered 列表供响应体展示；SessionNotifier 唤醒下游专家的逻辑被遗漏，导致串行链依赖解锁后下游专家不会自动被唤醒。V8 修复：patchTask done 分支遍历 triggered，逐一调 SessionNotifier.Dispatch
+- **[V9] 为什么不做 SQLite 持久化重试队列：** sessions_send 协议层无法确认投递（`timeoutSeconds:0` 永远返回 `ok:true`），SQLite 队列无法判断"何时停止重试"，会堆积永不清空的残留记录。内存重试 3 次足够覆盖"session 刚重建"窗口期；重启丢队列由 launchd+CEO startup 巡检兜底
+- **[V9] 为什么不加 `notified` 列：** `notified` 只记录创建时的通知状态，不反映后续 triggered dispatch 的状态；逻辑上"30 分钟没人 claim"就是 stale，无需区分原因；避免 schema 膨胀
+- **[V9] TouchUpdatedAt 不改 version：** stale re-dispatch 是系统内部操作，不应影响乐观锁；专家 claim 时 version 不变，避免 409 冲突
+- **[V9] stale ticker 为何选 Go server 内置而非 OpenClaw cron：** OpenClaw cron 发 systemEvent 给 CEO，但 CEO session 不在时消息丢失——这正是 stale 巡检要解决的问题，形成循环依赖。Go server 自驱 re-dispatch 不依赖任何外部 agent
 
 ---
 

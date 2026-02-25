@@ -465,6 +465,60 @@ func (s *Store) GetChainTasks(chainID string) ([]model.Task, error) {
 }
 
 // -------------------------------------------------------------------
+// Stale task helpers (V9)
+// -------------------------------------------------------------------
+
+// StaleCandidateRow is a compact view used by the stale ticker.
+type StaleCandidateRow struct {
+	ID         string
+	Title      string
+	AssignedTo string
+}
+
+// ListStaleCandidates returns pending tasks that have not been updated for at
+// least threshold duration and have a non-empty assigned_to.
+// Go-layer post-filter (deps_met) is done by the caller.
+//
+// NOTE: Go stores updated_at in RFC3339Nano format ("2006-01-02T15:04:05.999999999Z").
+// We pass the cutoff as the same format so lexicographic comparison works correctly.
+func (s *Store) ListStaleCandidates(threshold time.Duration) ([]StaleCandidateRow, error) {
+	cutoff := time.Now().UTC().Add(-threshold).Format(time.RFC3339Nano)
+	rows, err := s.db.Query(`
+		SELECT id, title, assigned_to FROM tasks
+		WHERE status = 'pending'
+		  AND assigned_to != ''
+		  AND updated_at < ?
+		ORDER BY updated_at ASC
+		LIMIT 20`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("ListStaleCandidates: %w", err)
+	}
+	defer rows.Close()
+
+	var result []StaleCandidateRow
+	for rows.Next() {
+		var r StaleCandidateRow
+		if err = rows.Scan(&r.ID, &r.Title, &r.AssignedTo); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// TouchUpdatedAt updates updated_at to now WITHOUT changing version.
+// Used by stale ticker to reset the 30-minute countdown after re-dispatch.
+func (s *Store) TouchUpdatedAt(id string) error {
+	_, err := s.db.Exec(
+		`UPDATE tasks SET updated_at = ? WHERE id = ?`,
+		time.Now().UTC(), id)
+	if err != nil {
+		return fmt.Errorf("TouchUpdatedAt: %w", err)
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------
 // retry_routing helpers (V8)
 // -------------------------------------------------------------------
 
