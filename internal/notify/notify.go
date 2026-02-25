@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -63,11 +64,7 @@ func (d *DiscordNotifier) Notify(task model.Task) error {
 }
 
 func (d *DiscordNotifier) send(task model.Task) error {
-	mention := ""
-	if d.userID != "" {
-		mention = fmt.Sprintf("<@%s> ", d.userID)
-	}
-	content := fmt.Sprintf("%s✅ 任务完成：%s (task_id: %s)", mention, task.Title, task.ID)
+	content := FormatMessage(task, d.userID, time.Now())
 
 	body, err := json.Marshal(map[string]string{"content": content})
 	if err != nil {
@@ -84,6 +81,48 @@ func (d *DiscordNotifier) send(task model.Task) error {
 		return fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// FormatMessage builds the Discord notification content for a completed task.
+// userID may be empty (no @mention in that case).
+// doneAt is the timestamp used for duration calculation (pass time.Now() in production).
+func FormatMessage(task model.Task, userID string, doneAt time.Time) string {
+	mention := ""
+	if userID != "" {
+		mention = fmt.Sprintf("<@%s> ", userID)
+	}
+
+	expert := task.AssignedTo
+	if expert == "" {
+		expert = "未知"
+	}
+
+	result := task.Result
+	if result == "" {
+		result = "（无）"
+	}
+
+	duration := FormatDuration(task.StartedAt, doneAt)
+
+	return fmt.Sprintf(
+		"%s✅ 任务完成\n**任务：** %s\n**专家：** %s\n**耗时：** %s\n**结果：** %s\n`task_id: %s`",
+		mention, task.Title, expert, duration, result, task.ID,
+	)
+}
+
+// FormatDuration computes a human-readable duration from startedAt to doneAt.
+// If startedAt is nil, returns "未知".
+// Duration < 1 min → "< 1 分钟"; otherwise → "约 X 分钟" (ceiling).
+func FormatDuration(startedAt *time.Time, doneAt time.Time) string {
+	if startedAt == nil {
+		return "未知"
+	}
+	elapsed := doneAt.Sub(*startedAt)
+	minutes := elapsed.Minutes()
+	if minutes < 1 {
+		return "< 1 分钟"
+	}
+	return fmt.Sprintf("约 %d 分钟", int(math.Ceil(minutes)))
 }
 
 // AsyncNotify runs n.Notify in a goroutine so the caller is never blocked.

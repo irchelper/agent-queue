@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   requires_review INTEGER NOT NULL DEFAULT 0,
   result          TEXT NOT NULL DEFAULT '',
   version         INTEGER NOT NULL DEFAULT 1,
+  started_at      DATETIME,
   created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -59,6 +60,10 @@ func Open(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("run schema: %w", err)
 	}
+
+	// Migration: add started_at to existing databases (SQLite ALTER TABLE is
+	// idempotent via the error-ignore approach; column already exists → no-op).
+	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN started_at DATETIME`)
 
 	return db, nil
 }

@@ -90,7 +90,7 @@ func (s *Store) ListTasks(status, assignedTo, parentID string, depsMetFilter *bo
 	}
 
 	query := `SELECT t.id, t.title, t.description, t.status, t.assigned_to, t.parent_id,
-	                 t.mode, t.requires_review, t.result, t.version, t.created_at, t.updated_at
+	                 t.mode, t.requires_review, t.result, t.version, t.started_at, t.created_at, t.updated_at
 	          FROM tasks t
 	          WHERE ` + strings.Join(where, " AND ") + `
 	          ORDER BY t.created_at ASC`
@@ -138,7 +138,7 @@ func (s *Store) ListTasks(status, assignedTo, parentID string, depsMetFilter *bo
 func (s *Store) GetByID(id string) (model.Task, error) {
 	row := s.db.QueryRow(`
 		SELECT id, title, description, status, assigned_to, parent_id,
-		       mode, requires_review, result, version, created_at, updated_at
+		       mode, requires_review, result, version, started_at, created_at, updated_at
 		FROM tasks WHERE id = ?`, id)
 
 	t, err := scanTaskRow(row)
@@ -237,7 +237,7 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 	// Fetch current task inside the transaction.
 	row := tx.QueryRow(`
 		SELECT id, title, description, status, assigned_to, parent_id,
-		       mode, requires_review, result, version, created_at, updated_at
+		       mode, requires_review, result, version, started_at, created_at, updated_at
 		FROM tasks WHERE id = ?`, id)
 
 	current, err := scanTaskRow(row)
@@ -265,6 +265,12 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 		}
 		setClauses = append(setClauses, "status = ?")
 		args = append(args, string(newStatus))
+
+		// Record started_at when task first moves to in_progress.
+		if newStatus == model.StatusInProgress && current.StartedAt == nil {
+			setClauses = append(setClauses, "started_at = ?")
+			args = append(args, now)
+		}
 
 		// On timeout/release back to pending, clear assigned_to.
 		if newStatus == model.StatusPending {
@@ -467,7 +473,7 @@ func scanTaskImpl(r taskScanner) (model.Task, error) {
 	var rr int
 	err := r.Scan(&t.ID, &t.Title, &t.Description, (*string)(&t.Status),
 		&t.AssignedTo, &t.ParentID, &t.Mode, &rr,
-		&t.Result, &t.Version, &t.CreatedAt, &t.UpdatedAt)
+		&t.Result, &t.Version, &t.StartedAt, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return model.Task{}, err
 	}

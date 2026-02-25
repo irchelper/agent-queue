@@ -18,18 +18,19 @@ const (
 
 // Task is the primary entity managed by agent-queue.
 type Task struct {
-	ID             string    `json:"id"`
-	Title          string    `json:"title"`
-	Description    string    `json:"description,omitempty"`
-	Status         Status    `json:"status"`
-	AssignedTo     string    `json:"assigned_to,omitempty"`
-	ParentID       string    `json:"parent_id,omitempty"`
-	Mode           string    `json:"mode,omitempty"`
-	RequiresReview bool      `json:"requires_review"`
-	Result         string    `json:"result,omitempty"`
-	Version        int       `json:"version"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             string     `json:"id"`
+	Title          string     `json:"title"`
+	Description    string     `json:"description,omitempty"`
+	Status         Status     `json:"status"`
+	AssignedTo     string     `json:"assigned_to,omitempty"`
+	ParentID       string     `json:"parent_id,omitempty"`
+	Mode           string     `json:"mode,omitempty"`
+	RequiresReview bool       `json:"requires_review"`
+	Result         string     `json:"result,omitempty"`
+	Version        int        `json:"version"`
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 
 	// Populated by detail queries.
 	DependsOn []string      `json:"depends_on,omitempty"`
