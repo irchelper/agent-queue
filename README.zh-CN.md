@@ -2,7 +2,21 @@
 
 # agent-queue
 
-面向 OpenClaw multi-agent 工作流的 SQLite 任务队列服务。通过 HTTP 协调多个 AI agent——持久化状态、乐观锁防重复认领、依赖关系自动解锁、Discord webhook 通知。
+**让 AI agent 自己跑，不需要人盯着。** agent-queue 是一个轻量级任务队列，让多个 AI agent 自主协调——不依赖任何中心调度者在线。
+
+Agent 主动 poll 任务、原子认领、通过 HTTP 汇报完成。串行链全程自动推进：任务 A 完成后，任务 B 自动解锁；下一个 agent 在下次 poll 时认领并执行，无需人工传递接力棒。
+
+基于 SQLite + Go 构建，单二进制，零外部依赖，本机直接运行。
+
+## 为什么需要 agent-queue？
+
+没有持久化任务队列的 multi-agent 系统会以可预期的方式崩溃：
+
+- **调度者单点故障**："CEO" agent 必须一直在线才能推进下一步。它一睡着，整条链就卡住。
+- **状态不持久**：任务状态存在 LLM 上下文里。上下文压缩或开新 session = 进度丢失。
+- **沉默失败**：Agent 完成了工作，但没人收到通知。用户只能来问"做完了吗？"
+
+agent-queue 把任务状态从 agent 记忆搬到 SQLite。任何 agent 崩溃后都能恢复。串行链自动推进。任务完成直接通知你。
 
 ## 功能列表
 
@@ -14,6 +28,8 @@
 - **F6 — Discord webhook**：任务 `done` → 异步 POST Discord Incoming Webhook（通过 `Notifier` 接口抽象）
 - **F7 — 原子派发**：`POST /dispatch` 一步完成建任务 + 触发 agent session
 - **F8 — 全局状态面板**：`GET /tasks/summary` 返回计数 + 当前活跃任务列表
+- **F9 — Agent 自驱 poll**：`GET /tasks/poll?assigned_to=X` 返回该 agent 当前最优任务（依赖感知 + 优先级排序）
+- **F10 — 串行链派发**：`POST /dispatch/chain` 一次性创建完整串行链，自动设置 `depends_on`
 
 ## 快速开始
 
@@ -48,30 +64,49 @@ go build -o agent-queue .
 | `POST` | `/tasks/:id/claim` | 原子认领，body：`{"version": N, "agent": "名称"}` |
 | `GET` | `/tasks/:id/deps-met` | 查询依赖是否全部满足 |
 | `POST` | `/dispatch` | 原子化建任务 + 触发 agent session |
+| `POST` | `/dispatch/chain` | 创建完整串行链，自动设置 `depends_on` |
+| `GET` | `/tasks/poll` | 返回该 agent 最优可认领任务（`?assigned_to=X`），无任务返回 `null` |
 | `GET` | `/tasks/summary` | 全局任务计数 + 活跃任务列表 |
 
-### 示例：串行任务链
+### 示例：自驱串行链
+
+一次提交完整链路，agent 各自 poll 认领，无需人工传递接力棒。
 
 ```bash
-# 创建任务 A
-A=$(curl -s -X POST localhost:19827/tasks \
+# CEO 一次性提交完整链路
+curl -s -X POST localhost:19827/dispatch/chain \
   -H 'Content-Type: application/json' \
-  -d '{"title":"步骤 A","assigned_to":"coder"}' | jq -r .id)
+  -d '{
+    "tasks": [
+      {"title": "实现功能", "assigned_to": "coder"},
+      {"title": "编写测试", "assigned_to": "qa"},
+      {"title": "更新文档", "assigned_to": "writer"}
+    ]
+  }'
+# 返回所有任务 ID，depends_on 已自动设置：coder → qa → writer
 
-# 创建依赖 A 的任务 B
-curl -s -X POST localhost:19827/tasks \
-  -H 'Content-Type: application/json' \
-  -d "{\"title\":\"步骤 B\",\"assigned_to\":\"qa\",\"depends_on\":[\"$A\"]}"
+# 每个 agent session 启动时自驱 poll（以 coder 为例）
+RESP=$(curl -s "localhost:19827/tasks/poll?assigned_to=coder")
+TASK_ID=$(echo $RESP | jq -r '.task.id // empty')
 
-# 认领并完成 A（自动解锁 B）
-VER=$(curl -s localhost:19827/tasks/$A | jq .version)
-curl -s -X POST localhost:19827/tasks/$A/claim \
-  -H 'Content-Type: application/json' \
-  -d "{\"version\":$VER,\"agent\":\"coder\"}"
+if [ -n "$TASK_ID" ]; then
+  VER=$(echo $RESP | jq -r '.task.version')
 
-curl -s -X PATCH localhost:19827/tasks/$A \
-  -H 'Content-Type: application/json' \
-  -d "{\"status\":\"done\",\"result\":\"步骤 A 完成\",\"version\":$((VER+1))}"
+  curl -s -X POST "localhost:19827/tasks/$TASK_ID/claim" \
+    -H 'Content-Type: application/json' \
+    -d "{\"version\":$VER,\"agent\":\"coder\"}"
+
+  curl -s -X PATCH "localhost:19827/tasks/$TASK_ID" \
+    -H 'Content-Type: application/json' \
+    -d "{\"status\":\"in_progress\",\"version\":$((VER+1))}"
+
+  # ... 执行任务 ...
+
+  curl -s -X PATCH "localhost:19827/tasks/$TASK_ID" \
+    -H 'Content-Type: application/json' \
+    -d "{\"status\":\"done\",\"result\":\"功能实现完成\",\"version\":$((VER+2))}"
+  # qa 任务自动解锁，qa agent 下次 poll 时认领
+fi
 ```
 
 ## 部署配置

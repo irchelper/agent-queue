@@ -2,7 +2,21 @@
 
 # agent-queue
 
-A SQLite-backed task queue for OpenClaw multi-agent workflows. Coordinates multiple AI agents via HTTP — persistent state, optimistic locking, automatic dependency resolution, and Discord webhook notifications.
+**Stop babysitting your AI agents.** agent-queue is a lightweight task queue that lets multiple AI agents coordinate autonomously — no central orchestrator required.
+
+Agents poll for work, claim tasks atomically, and report completion via HTTP. Serial chains run end-to-end without human intervention: when task A finishes, task B unlocks automatically; the next agent picks it up on its next poll cycle.
+
+Built with SQLite + Go. Single binary, zero external dependencies, runs on your laptop.
+
+## Why agent-queue?
+
+Without a persistent task queue, multi-agent systems break in predictable ways:
+
+- **The orchestrator bottleneck**: A "CEO" agent must stay online to push each step forward. It sleeps → the chain stalls.
+- **Lost state**: Task status lives in LLM context. Context compression or a new session = lost progress.
+- **Silent failures**: Agents complete work but no one is notified. Users ask "did it finish?" instead of being told.
+
+agent-queue moves task state out of agent memory and into SQLite. Any agent can crash and recover. Chains advance automatically. Completions notify you directly.
 
 ## Features
 
@@ -14,6 +28,8 @@ A SQLite-backed task queue for OpenClaw multi-agent workflows. Coordinates multi
 - **F6 — Discord webhook**: Task `done` → async POST to Discord Incoming Webhook (via `Notifier` interface)
 - **F7 — Atomic dispatch**: `POST /dispatch` creates task + triggers agent session in one call
 - **F8 — Summary panel**: `GET /tasks/summary` returns global counts + active task list
+- **F9 — Agent self-poll**: `GET /tasks/poll?assigned_to=X` returns the best available task for an agent (deps-aware, priority-sorted)
+- **F10 — Chain dispatch**: `POST /dispatch/chain` creates a full serial chain with `depends_on` set automatically
 
 ## Quick Start
 
@@ -48,30 +64,49 @@ go build -o agent-queue .
 | `POST` | `/tasks/:id/claim` | Atomic claim — body: `{"version": N, "agent": "name"}` |
 | `GET` | `/tasks/:id/deps-met` | Check if all dependencies are satisfied |
 | `POST` | `/dispatch` | Create task + trigger agent session atomically |
+| `POST` | `/dispatch/chain` | Create full serial chain with auto-set `depends_on` |
+| `GET` | `/tasks/poll` | Best available task for agent (`?assigned_to=X`); returns `null` if none |
 | `GET` | `/tasks/summary` | Global task counts + active task list |
 
-### Example: Serial task chain
+### Example: Autonomous serial chain
+
+Submit a full chain in one call. Agents pick up their tasks when ready — no manual handoff.
 
 ```bash
-# Create task A
-A=$(curl -s -X POST localhost:19827/tasks \
+# CEO submits the full chain
+curl -s -X POST localhost:19827/dispatch/chain \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Step A","assigned_to":"coder"}' | jq -r .id)
+  -d '{
+    "tasks": [
+      {"title": "Implement feature", "assigned_to": "coder"},
+      {"title": "Write tests",       "assigned_to": "qa"},
+      {"title": "Update docs",       "assigned_to": "writer"}
+    ]
+  }'
+# Returns all task IDs with depends_on set: coder → qa → writer
 
-# Create task B depending on A
-curl -s -X POST localhost:19827/tasks \
-  -H 'Content-Type: application/json' \
-  -d "{\"title\":\"Step B\",\"assigned_to\":\"qa\",\"depends_on\":[\"$A\"]}"
+# Each agent polls on session startup (self-driven)
+RESP=$(curl -s "localhost:19827/tasks/poll?assigned_to=coder")
+TASK_ID=$(echo $RESP | jq -r '.task.id // empty')
 
-# Claim and complete A (unlocks B automatically)
-VER=$(curl -s localhost:19827/tasks/$A | jq .version)
-curl -s -X POST localhost:19827/tasks/$A/claim \
-  -H 'Content-Type: application/json' \
-  -d "{\"version\":$VER,\"agent\":\"coder\"}"
+if [ -n "$TASK_ID" ]; then
+  VER=$(echo $RESP | jq -r '.task.version')
 
-curl -s -X PATCH localhost:19827/tasks/$A \
-  -H 'Content-Type: application/json' \
-  -d "{\"status\":\"done\",\"result\":\"Step A complete\",\"version\":$((VER+1))}"
+  curl -s -X POST "localhost:19827/tasks/$TASK_ID/claim" \
+    -H 'Content-Type: application/json' \
+    -d "{\"version\":$VER,\"agent\":\"coder\"}"
+
+  curl -s -X PATCH "localhost:19827/tasks/$TASK_ID" \
+    -H 'Content-Type: application/json' \
+    -d "{\"status\":\"in_progress\",\"version\":$((VER+1))}"
+
+  # ... do the work ...
+
+  curl -s -X PATCH "localhost:19827/tasks/$TASK_ID" \
+    -H 'Content-Type: application/json' \
+    -d "{\"status\":\"done\",\"result\":\"Feature implemented\",\"version\":$((VER+2))}"
+  # qa task auto-unlocks; qa agent picks it up on next poll
+fi
 ```
 
 ## Deployment Config
