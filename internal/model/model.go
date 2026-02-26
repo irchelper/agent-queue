@@ -35,6 +35,7 @@ type Task struct {
 	FailureReason         string     `json:"failure_reason,omitempty"`
 	Version               int        `json:"version"`
 	Priority              int        `json:"priority"`
+	StaleDispatchCount    int        `json:"stale_dispatch_count,omitempty"`
 	StartedAt             *time.Time `json:"started_at,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 	UpdatedAt             time.Time  `json:"updated_at"`

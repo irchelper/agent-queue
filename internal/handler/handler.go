@@ -30,10 +30,11 @@ type Handler struct {
 	db       *sql.DB
 
 	// stale ticker fields
-	staleStop     chan struct{}
-	staleWG       sync.WaitGroup
-	staleInterval time.Duration
-	staleThreshold time.Duration
+	staleStop          chan struct{}
+	staleWG            sync.WaitGroup
+	staleInterval      time.Duration
+	staleThreshold     time.Duration
+	maxStaleDispatches int
 }
 
 // New creates a Handler and registers all routes on mux.
@@ -48,14 +49,18 @@ func New(db *sql.DB, s *store.Store, n notify.Notifier, oc *openclaw.Client) *Ha
 		sessionN:       sn,
 		oc:             oc,
 		db:             db,
-		staleStop:      make(chan struct{}),
-		staleInterval:  envDuration("AGENT_QUEUE_STALE_CHECK_INTERVAL", 10*time.Minute),
-		staleThreshold: envDuration("AGENT_QUEUE_STALE_THRESHOLD", 30*time.Minute),
+		staleStop:          make(chan struct{}),
+		staleInterval:      envDuration("AGENT_QUEUE_STALE_CHECK_INTERVAL", 10*time.Minute),
+		staleThreshold:     envDuration("AGENT_QUEUE_STALE_THRESHOLD", 30*time.Minute),
+		maxStaleDispatches: envInt("AGENT_QUEUE_MAX_STALE_DISPATCHES", 3),
 	}
 }
 
 // SetStaleThresholdForTesting overrides the stale threshold. Test use only.
 func (h *Handler) SetStaleThresholdForTesting(d time.Duration) { h.staleThreshold = d }
+
+// SetMaxStaleDispatchesForTesting overrides the max stale dispatches. Test use only.
+func (h *Handler) SetMaxStaleDispatchesForTesting(n int) { h.maxStaleDispatches = n }
 
 // StartRetryQueue starts the SessionNotifier's internal retry queue goroutine.
 func (h *Handler) StartRetryQueue() {
@@ -126,11 +131,34 @@ func (h *Handler) checkStaleTasks() {
 		if !met {
 			continue
 		}
+		// Check stale dispatch limit.
+		if c.StaleDispatchCount >= h.maxStaleDispatches {
+			log.Printf("[stale_ticker] task %s (%s) reached max stale dispatches (%d), alerting CEO",
+				c.ID, c.Title, h.maxStaleDispatches)
+			if h.sessionN != nil {
+				// Construct a minimal Task for the CEO alert.
+				alertTask, err2 := h.store.GetByID(c.ID)
+				if err2 != nil {
+					log.Printf("[stale_ticker] GetByID %s for CEO alert: %v", c.ID, err2)
+					continue
+				}
+				alertTask.FailureReason = fmt.Sprintf("stale max dispatches reached (%d/%d)", c.StaleDispatchCount, h.maxStaleDispatches)
+				if err2 := h.sessionN.OnFailed(alertTask); err2 != nil {
+					log.Printf("[stale_ticker] OnFailed CEO alert for %s: %v", c.ID, err2)
+				}
+			}
+			// Touch to reset countdown and avoid repeated alerts every tick.
+			if err := h.store.TouchUpdatedAt(c.ID); err != nil {
+				log.Printf("[stale_ticker] TouchUpdatedAt(%s): %v", c.ID, err)
+			}
+			continue
+		}
+
 		// Re-dispatch: fire-and-forget sessions_send (Dispatch does not retry).
 		if _, ok := h.sessionN.Dispatch(c.AssignedTo); ok {
 			log.Printf("[stale_ticker] re-dispatched stale task %s (%s) to %s", c.ID, c.Title, c.AssignedTo)
 		}
-		// Reset the 30-min countdown regardless of dispatch success.
+		// Reset the 30-min countdown and increment stale_dispatch_count.
 		if err := h.store.TouchUpdatedAt(c.ID); err != nil {
 			log.Printf("[stale_ticker] TouchUpdatedAt(%s): %v", c.ID, err)
 		}
@@ -153,6 +181,20 @@ func envDuration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// envInt reads an environment variable as an int; falls back to def.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("[handler] invalid %s=%q, using default %d", key, v, def)
+		return def
+	}
+	return n
 }
 
 // Register wires up all routes on mux.

@@ -23,13 +23,15 @@ agent-queue moves task state out of agent memory and into SQLite. Any agent can 
 - **F1 — Task CRUD**: Create/query/update tasks with full lifecycle support
 - **F2 — Optimistic lock claim**: Atomic claim with `version` field; concurrent claim → 409 Conflict
 - **F3 — Dependency graph**: `depends_on` array; upstream `done` → downstream auto-unlocked
-- **F4 — 8-state machine**: `pending → claimed → in_progress → review → done / blocked / failed / cancelled`
+- **F4 — 8-state machine**: `pending → claimed → in_progress → review → done / blocked / failed / cancelled`; `cancelled` is a terminal state that does not trigger autoRetry or unlock downstream deps
 - **F5 — Health check**: `GET /health` returns service + database status
 - **F6 — Discord webhook**: Task `done`/`failed` → async POST to Discord Incoming Webhook; `failed` also triggers SessionNotifier → CEO (via `Notifier` interface)
 - **F7 — Atomic dispatch**: `POST /dispatch` creates task + triggers agent session in one call
 - **F8 — Summary panel**: `GET /tasks/summary` returns global counts + active task list
 - **F9 — Agent self-poll**: `GET /tasks/poll?assigned_to=X` returns the best available task for an agent (deps-aware, priority-sorted)
 - **F10 — Chain dispatch**: `POST /dispatch/chain` creates a full serial chain with `depends_on` set automatically
+- **F13 — Review-reject two-stage chain (V10)**: When thinker/security/vision fails a task and routes to a different agent, autoRetry creates a `fix task → re-review task` two-stage chain; downstream deps block until re-review approves. Supports multi-level reject via `UpdateSupersededByChain`
+- **F14 — Extended retry_routing seed (V10.1)**: 16 seed rules covering vision/pm/ops default routing; vision added to `isReviewReject` reviewer list
 
 ## Quick Start
 
@@ -165,7 +167,7 @@ make clean-all # remove binary AND database (destructive — clears all task his
 ## Architecture
 
 - **Storage**: SQLite WAL mode — single file, zero deployment, ACID transactions; path configurable via `AGENT_QUEUE_DB_PATH`
-- **API**: Go `net/http`, no framework, ~350 lines
+- **API**: Go `net/http`, no framework, ~800 lines (handler) + ~700 lines (store)
 - **Concurrency**: Optimistic locking via `version` field
 - **Agent reporting**: Agents only `PATCH /tasks` — no `sessions_send` required. Go server webhook is the sole notification channel.
 - **Notifications**: Discord Incoming Webhook (`done`/`failed` → user) + SessionNotifier (`failed` → CEO session, minimal format to prevent LLM misinterpretation), via `Notifier` interface (platform-agnostic)

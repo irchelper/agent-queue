@@ -92,7 +92,7 @@ func (s *Store) ListTasks(status, assignedTo, parentID string, depsMetFilter *bo
 	}
 
 	query := `SELECT t.id, t.title, t.description, t.status, t.assigned_to, t.retry_assigned_to, t.superseded_by,
-	                 t.chain_id, t.notify_ceo_on_complete, t.parent_id,
+	                 t.chain_id, t.notify_ceo_on_complete, t.stale_dispatch_count, t.parent_id,
 	                 t.mode, t.requires_review, t.result, t.failure_reason, t.version, t.priority, t.started_at, t.created_at, t.updated_at
 	          FROM tasks t
 	          WHERE ` + strings.Join(where, " AND ") + `
@@ -141,7 +141,7 @@ func (s *Store) ListTasks(status, assignedTo, parentID string, depsMetFilter *bo
 func (s *Store) GetByID(id string) (model.Task, error) {
 	row := s.db.QueryRow(`
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
-		       chain_id, notify_ceo_on_complete, parent_id,
+		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id,
 		       mode, requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at
 		FROM tasks WHERE id = ?`, id)
 
@@ -241,7 +241,7 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 	// Fetch current task inside the transaction.
 	row := tx.QueryRow(`
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
-		       chain_id, notify_ceo_on_complete, parent_id,
+		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id,
 		       mode, requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at
 		FROM tasks WHERE id = ?`, id)
 
@@ -458,7 +458,7 @@ func (s *Store) IsChainComplete(chainID string) (bool, error) {
 func (s *Store) GetChainTasks(chainID string) ([]model.Task, error) {
 	rows, err := s.db.Query(`
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
-		       chain_id, notify_ceo_on_complete, parent_id, mode,
+		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id, mode,
 		       requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at
 		FROM tasks WHERE chain_id = ?
 		ORDER BY created_at ASC`, chainID)
@@ -483,9 +483,10 @@ func (s *Store) GetChainTasks(chainID string) ([]model.Task, error) {
 
 // StaleCandidateRow is a compact view used by the stale ticker.
 type StaleCandidateRow struct {
-	ID         string
-	Title      string
-	AssignedTo string
+	ID                 string
+	Title              string
+	AssignedTo         string
+	StaleDispatchCount int
 }
 
 // ListStaleCandidates returns pending tasks that have not been updated for at
@@ -497,7 +498,7 @@ type StaleCandidateRow struct {
 func (s *Store) ListStaleCandidates(threshold time.Duration) ([]StaleCandidateRow, error) {
 	cutoff := time.Now().UTC().Add(-threshold).Format(time.RFC3339Nano)
 	rows, err := s.db.Query(`
-		SELECT id, title, assigned_to FROM tasks
+		SELECT id, title, assigned_to, stale_dispatch_count FROM tasks
 		WHERE status = 'pending'
 		  AND assigned_to != ''
 		  AND updated_at < ?
@@ -511,7 +512,7 @@ func (s *Store) ListStaleCandidates(threshold time.Duration) ([]StaleCandidateRo
 	var result []StaleCandidateRow
 	for rows.Next() {
 		var r StaleCandidateRow
-		if err = rows.Scan(&r.ID, &r.Title, &r.AssignedTo); err != nil {
+		if err = rows.Scan(&r.ID, &r.Title, &r.AssignedTo, &r.StaleDispatchCount); err != nil {
 			return nil, err
 		}
 		result = append(result, r)
@@ -519,11 +520,12 @@ func (s *Store) ListStaleCandidates(threshold time.Duration) ([]StaleCandidateRo
 	return result, rows.Err()
 }
 
-// TouchUpdatedAt updates updated_at to now WITHOUT changing version.
+// TouchUpdatedAt updates updated_at to now and increments stale_dispatch_count.
+// Does NOT change version (avoids optimistic lock conflicts).
 // Used by stale ticker to reset the 30-minute countdown after re-dispatch.
 func (s *Store) TouchUpdatedAt(id string) error {
 	_, err := s.db.Exec(
-		`UPDATE tasks SET updated_at = ? WHERE id = ?`,
+		`UPDATE tasks SET updated_at = ?, stale_dispatch_count = stale_dispatch_count + 1 WHERE id = ?`,
 		time.Now().UTC(), id)
 	if err != nil {
 		return fmt.Errorf("TouchUpdatedAt: %w", err)
@@ -685,7 +687,7 @@ func (s *Store) Poll(assignedTo string) (*model.Task, error) {
 	// Phase 1: collect all candidate tasks (close cursor before deps check).
 	rows, err := s.db.Query(`
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
-		       chain_id, notify_ceo_on_complete, parent_id, mode,
+		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id, mode,
 		       requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at
 		FROM tasks
 		WHERE status = 'pending' AND assigned_to = ?
@@ -929,6 +931,7 @@ func scanTaskImpl(r taskScanner) (model.Task, error) {
 	var rr, notifyCEO int
 	err := r.Scan(&t.ID, &t.Title, &t.Description, (*string)(&t.Status),
 		&t.AssignedTo, &t.RetryAssignedTo, &t.SupersededBy, &t.ChainID, &notifyCEO,
+		&t.StaleDispatchCount,
 		&t.ParentID, &t.Mode, &rr,
 		&t.Result, &t.FailureReason, &t.Version, &t.Priority,
 		&t.StartedAt, &t.CreatedAt, &t.UpdatedAt)

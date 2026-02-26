@@ -2551,3 +2551,122 @@ func TestCancelled_NoDownstreamUnlock(t *testing.T) {
 		t.Fatal("downstream should NOT be deps_met after parent is cancelled (not done)")
 	}
 }
+
+// -------------------------------------------------------------------
+// V11: stale ticker max_dispatches
+// -------------------------------------------------------------------
+
+// TestV11_StaleTicker_MaxDispatches verifies that when stale_dispatch_count
+// reaches maxStaleDispatches, the CEO is alerted instead of re-dispatching.
+func TestV11_StaleTicker_MaxDispatches(t *testing.T) {
+	var mu sync.Mutex
+	var ceoMessages []string
+
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if msg, ok := args["message"].(string); ok {
+				mu.Lock()
+				ceoMessages = append(ceoMessages, msg)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+
+	// Set max to 2 for fast testing.
+	h.SetMaxStaleDispatchesForTesting(2)
+	h.SetStaleThresholdForTesting(50 * time.Millisecond)
+
+	// Create a task with e2e-coder (not real agent → no session_send).
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "stale-maxdisp", "assigned_to": "e2e-coder"})
+	var task model.Task
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	// Manually set stale_dispatch_count = 2 (at limit) by running ticker twice normally.
+	// Simpler: directly manipulate via two CheckStaleTasks calls after threshold passes.
+	time.Sleep(100 * time.Millisecond)
+
+	// First tick: dispatch count goes 0→1 (below limit)
+	h.CheckStaleTasks()
+	time.Sleep(20 * time.Millisecond)
+
+	// Second tick: dispatch count goes 1→2 (now AT limit)
+	h.CheckStaleTasks()
+	time.Sleep(20 * time.Millisecond)
+
+	// Third tick: count is 2 = maxStaleDispatches → should alert CEO instead of dispatching
+	h.CheckStaleTasks()
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	snap := make([]string, len(ceoMessages))
+	copy(snap, ceoMessages)
+	mu.Unlock()
+
+	// Should have received a CEO alert containing "stale" or "❌"
+	found := false
+	for _, msg := range snap {
+		if strings.Contains(msg, "stale-maxdisp") || strings.Contains(msg, "❌") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("CEO should have been alerted for stale max dispatches, got: %v", snap)
+	}
+}
+
+// TestV11_StaleTicker_BelowMax_NoCEOAlert verifies that below max dispatches,
+// the CEO is not alerted (normal re-dispatch).
+func TestV11_StaleTicker_BelowMax_NoCEOAlert(t *testing.T) {
+	var mu sync.Mutex
+	var ceoMessages []string
+
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if msg, ok := args["message"].(string); ok {
+				mu.Lock()
+				ceoMessages = append(ceoMessages, msg)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+
+	h.SetMaxStaleDispatchesForTesting(5) // high limit
+	h.SetStaleThresholdForTesting(50 * time.Millisecond)
+
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "stale-below-max", "assigned_to": "e2e-coder"})
+	var task model.Task
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	time.Sleep(100 * time.Millisecond)
+	h.CheckStaleTasks()
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	snap := make([]string, len(ceoMessages))
+	copy(snap, ceoMessages)
+	mu.Unlock()
+
+	for _, msg := range snap {
+		if strings.Contains(msg, "stale-below-max") {
+			t.Errorf("CEO should NOT be alerted for below-max stale dispatch, got: %v", snap)
+		}
+	}
+}

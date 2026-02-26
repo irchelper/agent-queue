@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/irchelper/agent-queue/internal/model"
@@ -29,24 +30,55 @@ func (NoOp) Notify(task model.Task) error {
 }
 
 // DiscordNotifier sends a message to a Discord Incoming Webhook.
+// Per-agent webhook routing: if AGENT_QUEUE_AGENT_WEBHOOKS is set (format:
+// "agentId1=url1,agentId2=url2,..."), Notify uses the agent-specific URL for
+// task.AssignedTo, falling back to the default webhookURL on a miss.
 type DiscordNotifier struct {
-	webhookURL string
-	userID     string
-	client     *http.Client
+	webhookURL    string
+	userID        string
+	agentWebhooks map[string]string // agentId → webhookURL
+	client        *http.Client
 }
 
 // NewFromEnv returns a DiscordNotifier if AGENT_QUEUE_DISCORD_WEBHOOK_URL is
 // set, otherwise a NoOp notifier.
+// Also parses AGENT_QUEUE_AGENT_WEBHOOKS for per-agent routing.
 func NewFromEnv() Notifier {
 	url := os.Getenv("AGENT_QUEUE_DISCORD_WEBHOOK_URL")
 	if url == "" {
 		return NoOp{}
 	}
 	return &DiscordNotifier{
-		webhookURL: url,
-		userID:     os.Getenv("AGENT_QUEUE_DISCORD_USER_ID"),
-		client:     &http.Client{Timeout: 10 * time.Second},
+		webhookURL:    url,
+		userID:        os.Getenv("AGENT_QUEUE_DISCORD_USER_ID"),
+		agentWebhooks: parseAgentWebhooks(os.Getenv("AGENT_QUEUE_AGENT_WEBHOOKS")),
+		client:        &http.Client{Timeout: 10 * time.Second},
 	}
+}
+
+// parseAgentWebhooks parses "agent1=url1,agent2=url2,..." into a map.
+// Malformed entries are silently skipped.
+func parseAgentWebhooks(raw string) map[string]string {
+	m := make(map[string]string)
+	if raw == "" {
+		return m
+	}
+	for _, entry := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			m[parts[0]] = parts[1]
+		}
+	}
+	return m
+}
+
+// resolveWebhookURL returns the agent-specific URL for the given agentID,
+// falling back to the default webhookURL if no entry is found.
+func (d *DiscordNotifier) resolveWebhookURL(agentID string) string {
+	if url, ok := d.agentWebhooks[agentID]; ok {
+		return url
+	}
+	return d.webhookURL
 }
 
 // Notify sends a Discord webhook message.  It retries once on failure.
@@ -74,7 +106,9 @@ func (d *DiscordNotifier) send(task model.Task) error {
 		return fmt.Errorf("marshal body: %w", err)
 	}
 
-	resp, err := d.client.Post(d.webhookURL, "application/json", bytes.NewReader(body))
+	// Route to agent-specific webhook if configured; fallback to default.
+	webhookURL := d.resolveWebhookURL(task.AssignedTo)
+	resp, err := d.client.Post(webhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)
 	}

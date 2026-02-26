@@ -1,6 +1,6 @@
 # agent-queue PRD
 
-> Status: Draft → v5
+> Status: Draft → v10
 > Owner: 产品经理
 > Date: 2026-02-25
 > Updated: 2026-02-26 (v11 — V9: 新增 F17 SessionNotifier 内存重试队列（CEO通知3次/30s-60s-120s backoff）、F18 stale任务自动re-dispatch（10min ticker/30min阈值）)

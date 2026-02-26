@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   superseded_by            TEXT NOT NULL DEFAULT '',
   chain_id                 TEXT NOT NULL DEFAULT '',
   notify_ceo_on_complete   INTEGER NOT NULL DEFAULT 0,
+  stale_dispatch_count     INTEGER NOT NULL DEFAULT 0,
   parent_id                TEXT NOT NULL DEFAULT '',
   mode                     TEXT NOT NULL DEFAULT '',
   requires_review          INTEGER NOT NULL DEFAULT 0,
@@ -83,6 +84,7 @@ func Open(path string) (*sql.DB, error) {
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN superseded_by TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN chain_id TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN notify_ceo_on_complete INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN stale_dispatch_count INTEGER NOT NULL DEFAULT 0`)
 
 	// Seed retry_routing initial data (idempotent: only insert if table is empty).
 	if err = seedRetryRouting(db); err != nil {
