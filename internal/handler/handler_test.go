@@ -779,14 +779,14 @@ func TestFailed_NoRetryDirective_CEOAlert(t *testing.T) {
 	defer srv.Close()
 
 	// Use an agent not in retry_routing to ensure no table match → CEO alert.
-	// Create task manually with assigned_to="vision" (no catch-all in seed data).
+	// "scaffold" has no catch-all in seed data (vision/pm/ops were added in V10).
 	var task model.Task
-	r := postJSON(t, srv, "/tasks", map[string]any{"title": "vision-task", "assigned_to": "vision"})
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "scaffold-task", "assigned_to": "scaffold"})
 	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
 	r.Body.Close()
 
 	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
-		map[string]any{"version": task.Version, "agent": "vision"})
+		map[string]any{"version": task.Version, "agent": "scaffold"})
 	var claimed model.Task
 	json.NewDecoder(claimR.Body).Decode(&claimed) //nolint:errcheck
 	claimR.Body.Close()
@@ -809,7 +809,7 @@ func TestFailed_NoRetryDirective_CEOAlert(t *testing.T) {
 
 	found := false
 	for _, msg := range snap {
-		if strings.Contains(msg, "❌") && strings.Contains(msg, "vision-task") {
+		if strings.Contains(msg, "❌") && strings.Contains(msg, "scaffold-task") {
 			found = true
 		}
 	}
@@ -1418,5 +1418,948 @@ func TestV9_StaleTicker_SkipsDepsPendingTasks(t *testing.T) {
 		if key == writerKey {
 			t.Errorf("writer task %s should not be re-dispatched (deps not met), dispatched: %v", taskB.ID, snap)
 		}
+	}
+}
+
+// -------------------------------------------------------------------
+// V10: review-reject two-stage chain (autoRetryReviewReject)
+// -------------------------------------------------------------------
+
+// patchTaskToFailed drives a task through claim→in_progress→failed with given result.
+func patchTaskToFailed(t *testing.T, srv *httptest.Server, taskID string, version int, agent, result string) model.Task {
+	t.Helper()
+	claimR := postJSON(t, srv, "/tasks/"+taskID+"/claim",
+		map[string]any{"version": version, "agent": agent})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed) //nolint:errcheck
+	claimR.Body.Close()
+
+	ipTask := patchTaskTo(t, srv, taskID, "in_progress", claimed.Version)
+
+	body, _ := json.Marshal(map[string]any{
+		"status":  "failed",
+		"result":  result,
+		"version": ipTask.Version,
+	})
+	req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/tasks/"+taskID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := http.DefaultClient.Do(req)
+	var pr struct{ Task model.Task }
+	json.NewDecoder(resp.Body).Decode(&pr) //nolint:errcheck
+	resp.Body.Close()
+	return pr.Task
+}
+
+// driveTaskToDone drives a task through claim→in_progress→done.
+func driveTaskToDone(t *testing.T, srv *httptest.Server, taskID string, version int, agent string) model.Task {
+	t.Helper()
+	claimR := postJSON(t, srv, "/tasks/"+taskID+"/claim",
+		map[string]any{"version": version, "agent": agent})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed) //nolint:errcheck
+	claimR.Body.Close()
+
+	ipTask := patchTaskTo(t, srv, taskID, "in_progress", claimed.Version)
+	return patchTaskTo(t, srv, taskID, "done", ipTask.Version)
+}
+
+// TestV10_ReviewReject_TwoStageChain verifies that when thinker fails a review
+// task with retry_assigned_to pointing to a different agent (coder), a two-stage
+// chain is created: fix task (coder) → re-review task (thinker).
+// The original task's superseded_by should point to re-review (not fix),
+// so downstream deps (e.g. qa) wait until re-review passes.
+func TestV10_ReviewReject_TwoStageChain(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create chain: coder → thinker(review) → qa
+	chainResp := postJSON(t, srv, "/dispatch/chain", map[string]any{
+		"tasks": []map[string]any{
+			{"title": "impl-task", "assigned_to": "coder"},
+			{"title": "review-task", "assigned_to": "thinker"},
+			{"title": "qa-task", "assigned_to": "qa"},
+		},
+	})
+	if chainResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", chainResp.StatusCode)
+	}
+	var cr model.ChainResponse
+	json.NewDecoder(chainResp.Body).Decode(&cr) //nolint:errcheck
+	chainResp.Body.Close()
+
+	implTask := cr.Tasks[0]
+	reviewTask := cr.Tasks[1]
+	qaTask := cr.Tasks[2]
+
+	// Drive impl to done.
+	driveTaskToDone(t, srv, implTask.ID, implTask.Version, "coder")
+	time.Sleep(50 * time.Millisecond)
+
+	// Drive review to failed with REQUEST_CHANGES → triggers review-reject two-stage.
+	// thinker rejects → retry goes to coder (different agent = review-reject).
+	patchTaskToFailed(t, srv, reviewTask.ID, reviewTask.Version, "thinker",
+		"REQUEST_CHANGES: 代码有问题 | retry_assigned_to: coder")
+
+	// Allow autoRetry goroutine to complete.
+	time.Sleep(200 * time.Millisecond)
+
+	// Find fix and re-review tasks.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fixTask, reReviewTask *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "fix:") {
+			fixTask = t2
+		}
+		if strings.HasPrefix(t2.Title, "re-review:") {
+			reReviewTask = t2
+		}
+	}
+
+	if fixTask == nil {
+		t.Fatal("expected a 'fix: ...' task to be created")
+	}
+	if reReviewTask == nil {
+		t.Fatal("expected a 're-review: ...' task to be created")
+	}
+
+	// Verify fix task is assigned to coder (the implementer).
+	if fixTask.AssignedTo != "coder" {
+		t.Fatalf("fix task should be assigned to coder, got %q", fixTask.AssignedTo)
+	}
+	// Verify re-review task is assigned to thinker (original reviewer).
+	if reReviewTask.AssignedTo != "thinker" {
+		t.Fatalf("re-review task should be assigned to thinker, got %q", reReviewTask.AssignedTo)
+	}
+
+	// Verify re-review depends on fix.
+	reReviewDetail := getJSON(t, srv, "/tasks/"+reReviewTask.ID)
+	var rrDetail model.Task
+	json.NewDecoder(reReviewDetail.Body).Decode(&rrDetail) //nolint:errcheck
+	reReviewDetail.Body.Close()
+	if len(rrDetail.DependsOn) != 1 || rrDetail.DependsOn[0] != fixTask.ID {
+		t.Fatalf("re-review should depend on fix task, got %v", rrDetail.DependsOn)
+	}
+
+	// Verify original review task's superseded_by → re-review (NOT fix).
+	reviewDetail := getJSON(t, srv, "/tasks/"+reviewTask.ID)
+	var rvDetail model.Task
+	json.NewDecoder(reviewDetail.Body).Decode(&rvDetail) //nolint:errcheck
+	reviewDetail.Body.Close()
+	if rvDetail.SupersededBy != reReviewTask.ID {
+		t.Fatalf("original review.superseded_by should point to re-review %q, got %q",
+			reReviewTask.ID, rvDetail.SupersededBy)
+	}
+
+	// qa task should NOT be deps_met yet (re-review not done).
+	depsResp := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm model.DepsMet
+	json.NewDecoder(depsResp.Body).Decode(&dm) //nolint:errcheck
+	depsResp.Body.Close()
+	if dm.DepsMet {
+		t.Fatal("qa task should NOT be deps_met while re-review is pending")
+	}
+
+	// Drive fix task to done.
+	driveTaskToDone(t, srv, fixTask.ID, fixTask.Version, "coder")
+	time.Sleep(100 * time.Millisecond)
+
+	// qa still NOT deps_met (re-review still pending).
+	depsResp2 := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm2 model.DepsMet
+	json.NewDecoder(depsResp2.Body).Decode(&dm2) //nolint:errcheck
+	depsResp2.Body.Close()
+	if dm2.DepsMet {
+		t.Fatal("qa task should NOT be deps_met while re-review is still pending (fix done but re-review not)")
+	}
+
+	// Drive re-review to done.
+	// Re-fetch re-review to get latest version.
+	rrLatest := getJSON(t, srv, "/tasks/"+reReviewTask.ID)
+	var rrLatestTask model.Task
+	json.NewDecoder(rrLatest.Body).Decode(&rrLatestTask) //nolint:errcheck
+	rrLatest.Body.Close()
+	driveTaskToDone(t, srv, reReviewTask.ID, rrLatestTask.Version, "thinker")
+	time.Sleep(100 * time.Millisecond)
+
+	// NOW qa should be deps_met.
+	depsResp3 := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm3 model.DepsMet
+	json.NewDecoder(depsResp3.Body).Decode(&dm3) //nolint:errcheck
+	depsResp3.Body.Close()
+	if !dm3.DepsMet {
+		t.Fatal("qa task should be deps_met after re-review is done")
+	}
+}
+
+// TestV10_ReviewReject_SecurityAgent verifies that security agent also triggers
+// the two-stage review-reject flow (not just thinker).
+func TestV10_ReviewReject_SecurityAgent(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create a security review task directly.
+	var secTask model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{
+		"title":       "security-review",
+		"assigned_to": "security",
+	})
+	json.NewDecoder(r.Body).Decode(&secTask) //nolint:errcheck
+	r.Body.Close()
+
+	// Drive to failed with retry to coder.
+	patchTaskToFailed(t, srv, secTask.ID, secTask.Version, "security",
+		"安全漏洞 | retry_assigned_to: coder")
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Should create fix + re-review (two-stage), not a single retry.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fixTask, reReviewTask *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "fix:") {
+			fixTask = t2
+		}
+		if strings.HasPrefix(t2.Title, "re-review:") {
+			reReviewTask = t2
+		}
+	}
+
+	if fixTask == nil {
+		t.Fatal("security review-reject should create a fix task")
+	}
+	if reReviewTask == nil {
+		t.Fatal("security review-reject should create a re-review task")
+	}
+	if fixTask.AssignedTo != "coder" {
+		t.Fatalf("fix task should be assigned to coder, got %q", fixTask.AssignedTo)
+	}
+	if reReviewTask.AssignedTo != "security" {
+		t.Fatalf("re-review task should be assigned back to security, got %q", reReviewTask.AssignedTo)
+	}
+}
+
+// TestV10_NonReviewReject_SingleRetry verifies that when the original task is NOT
+// assigned to a reviewer (thinker/security) OR the retry agent is the same,
+// the standard single-retry path is used (no two-stage chain).
+func TestV10_NonReviewReject_SingleRetry(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// coder task fails → retry to thinker (standard single retry, not review-reject).
+	driveToFailed(t, srv, "coder-task-fail", "编译失败 | retry_assigned_to: thinker")
+
+	time.Sleep(200 * time.Millisecond)
+
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var retryTask *model.Task
+	var fixTask *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "retry:") {
+			retryTask = t2
+		}
+		if strings.HasPrefix(t2.Title, "fix:") {
+			fixTask = t2
+		}
+	}
+
+	// Should use single retry, NOT two-stage.
+	if retryTask == nil {
+		t.Fatal("expected a 'retry: ...' task (single retry)")
+	}
+	if fixTask != nil {
+		t.Fatal("should NOT create a 'fix: ...' task for non-review-reject scenario")
+	}
+	if retryTask.AssignedTo != "thinker" {
+		t.Fatalf("retry task should be assigned to thinker, got %q", retryTask.AssignedTo)
+	}
+}
+
+// TestV10_ReviewReject_SameAgent_SingleRetry verifies that when thinker fails
+// and retries to itself (same agent), it uses single retry, not two-stage.
+func TestV10_ReviewReject_SameAgent_SingleRetry(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create a thinker task that retries to itself.
+	var tTask model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{
+		"title":       "thinker-self-retry",
+		"assigned_to": "thinker",
+	})
+	json.NewDecoder(r.Body).Decode(&tTask) //nolint:errcheck
+	r.Body.Close()
+
+	patchTaskToFailed(t, srv, tTask.ID, tTask.Version, "thinker",
+		"需要重新思考 | retry_assigned_to: thinker")
+
+	time.Sleep(200 * time.Millisecond)
+
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var retryTask *model.Task
+	var fixTask *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "retry:") {
+			retryTask = t2
+		}
+		if strings.HasPrefix(t2.Title, "fix:") {
+			fixTask = t2
+		}
+	}
+
+	// Same agent → single retry, not two-stage.
+	if retryTask == nil {
+		t.Fatal("expected single 'retry: ...' task when thinker retries to itself")
+	}
+	if fixTask != nil {
+		t.Fatal("should NOT create fix/re-review for same-agent retry")
+	}
+}
+
+// TestV10_MultiLevelReject_UpdateSupersededByChain verifies that when a re-review
+// itself fails again (multi-level reject), UpdateSupersededByChain correctly
+// redirects existing superseded_by pointers so downstream deps follow the latest chain.
+func TestV10_MultiLevelReject_UpdateSupersededByChain(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create chain: coder → thinker → qa
+	chainResp := postJSON(t, srv, "/dispatch/chain", map[string]any{
+		"tasks": []map[string]any{
+			{"title": "impl", "assigned_to": "coder"},
+			{"title": "review", "assigned_to": "thinker"},
+			{"title": "test", "assigned_to": "qa"},
+		},
+	})
+	var cr model.ChainResponse
+	json.NewDecoder(chainResp.Body).Decode(&cr) //nolint:errcheck
+	chainResp.Body.Close()
+
+	implTask := cr.Tasks[0]
+	reviewTask := cr.Tasks[1]
+	qaTask := cr.Tasks[2]
+
+	// Drive impl to done.
+	driveTaskToDone(t, srv, implTask.ID, implTask.Version, "coder")
+	time.Sleep(50 * time.Millisecond)
+
+	// === First reject ===
+	patchTaskToFailed(t, srv, reviewTask.ID, reviewTask.Version, "thinker",
+		"REQUEST_CHANGES: 第一次退单 | retry_assigned_to: coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// Find first fix and re-review tasks.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fix1, reReview1 *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "fix:") && fix1 == nil {
+			fix1 = t2
+		}
+		if strings.HasPrefix(t2.Title, "re-review:") && reReview1 == nil {
+			reReview1 = t2
+		}
+	}
+	if fix1 == nil || reReview1 == nil {
+		t.Fatal("first reject should create fix + re-review tasks")
+	}
+
+	// Drive fix1 to done so re-review1 becomes available.
+	driveTaskToDone(t, srv, fix1.ID, fix1.Version, "coder")
+	time.Sleep(100 * time.Millisecond)
+
+	// === Second reject: re-review1 also fails ===
+	rr1Latest := getJSON(t, srv, "/tasks/"+reReview1.ID)
+	var rr1Detail model.Task
+	json.NewDecoder(rr1Latest.Body).Decode(&rr1Detail) //nolint:errcheck
+	rr1Latest.Body.Close()
+
+	patchTaskToFailed(t, srv, reReview1.ID, rr1Detail.Version, "thinker",
+		"REQUEST_CHANGES: 第二次退单 | retry_assigned_to: coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// Find second fix and re-review tasks.
+	listResp2 := getJSON(t, srv, "/tasks")
+	var listBody2 struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp2.Body).Decode(&listBody2) //nolint:errcheck
+	listResp2.Body.Close()
+
+	var fix2, reReview2 *model.Task
+	for i := range listBody2.Tasks {
+		t2 := &listBody2.Tasks[i]
+		// Skip first-round tasks.
+		if t2.ID == fix1.ID || t2.ID == reReview1.ID {
+			continue
+		}
+		if strings.HasPrefix(t2.Title, "fix:") && fix2 == nil {
+			fix2 = t2
+		}
+		if strings.HasPrefix(t2.Title, "re-review:") && reReview2 == nil {
+			reReview2 = t2
+		}
+	}
+	if fix2 == nil || reReview2 == nil {
+		t.Fatal("second reject should create a new fix + re-review pair")
+	}
+
+	// Key assertion: original review task's superseded_by should now point to
+	// reReview2 (updated by UpdateSupersededByChain), not reReview1.
+	origReview := getJSON(t, srv, "/tasks/"+reviewTask.ID)
+	var origDetail model.Task
+	json.NewDecoder(origReview.Body).Decode(&origDetail) //nolint:errcheck
+	origReview.Body.Close()
+
+	if origDetail.SupersededBy != reReview2.ID {
+		t.Fatalf("original review.superseded_by should be updated to reReview2 %q by UpdateSupersededByChain, got %q",
+			reReview2.ID, origDetail.SupersededBy)
+	}
+
+	// qa should NOT be deps_met (reReview2 not done).
+	depsResp := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm model.DepsMet
+	json.NewDecoder(depsResp.Body).Decode(&dm) //nolint:errcheck
+	depsResp.Body.Close()
+	if dm.DepsMet {
+		t.Fatal("qa should NOT be deps_met while second re-review is pending")
+	}
+
+	// Drive fix2 + reReview2 to done → qa should finally be deps_met.
+	driveTaskToDone(t, srv, fix2.ID, fix2.Version, "coder")
+	time.Sleep(100 * time.Millisecond)
+
+	rr2Latest := getJSON(t, srv, "/tasks/"+reReview2.ID)
+	var rr2Detail model.Task
+	json.NewDecoder(rr2Latest.Body).Decode(&rr2Detail) //nolint:errcheck
+	rr2Latest.Body.Close()
+
+	driveTaskToDone(t, srv, reReview2.ID, rr2Detail.Version, "thinker")
+	time.Sleep(100 * time.Millisecond)
+
+	depsResp2 := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm2 model.DepsMet
+	json.NewDecoder(depsResp2.Body).Decode(&dm2) //nolint:errcheck
+	depsResp2.Body.Close()
+	if !dm2.DepsMet {
+		t.Fatal("qa should be deps_met after second re-review is done")
+	}
+}
+
+// TestV10_ReviewReject_FixDispatchedReReviewAutoTriggered verifies that only the
+// fix task is dispatched immediately; the re-review task is auto-triggered when
+// the fix task completes (via the standard deps-met + triggered dispatch flow).
+func TestV10_ReviewReject_FixDispatchedReReviewAutoTriggered(t *testing.T) {
+	var mu sync.Mutex
+	var dispatched []string
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if key, ok := args["sessionKey"].(string); ok {
+				mu.Lock()
+				dispatched = append(dispatched, key)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create a thinker task.
+	var tTask model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{
+		"title":       "thinker-review",
+		"assigned_to": "thinker",
+	})
+	json.NewDecoder(r.Body).Decode(&tTask) //nolint:errcheck
+	r.Body.Close()
+
+	// Fail it → triggers two-stage.
+	patchTaskToFailed(t, srv, tTask.ID, tTask.Version, "thinker",
+		"REQUEST_CHANGES | retry_assigned_to: coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// After the review-reject, coder should have been dispatched (for fix task).
+	coderKey := "agent:coder:discord:channel:1475338640593916045"
+	thinkerKey := "agent:thinker:discord:channel:1475338689646297305"
+
+	mu.Lock()
+	dispatchedAfterReject := make([]string, len(dispatched))
+	copy(dispatchedAfterReject, dispatched)
+	dispatched = nil // reset for next phase
+	mu.Unlock()
+
+	coderDispatched := false
+	for _, key := range dispatchedAfterReject {
+		if key == coderKey {
+			coderDispatched = true
+		}
+	}
+	if !coderDispatched {
+		t.Errorf("coder should have been dispatched for fix task, got: %v", dispatchedAfterReject)
+	}
+
+	// Find and drive fix task to done → should trigger dispatch to thinker for re-review.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fixTask *model.Task
+	for i := range listBody.Tasks {
+		if strings.HasPrefix(listBody.Tasks[i].Title, "fix:") {
+			fixTask = &listBody.Tasks[i]
+			break
+		}
+	}
+	if fixTask == nil {
+		t.Fatal("fix task not found")
+	}
+
+	driveTaskToDone(t, srv, fixTask.ID, fixTask.Version, "coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// Thinker should be dispatched for the re-review.
+	mu.Lock()
+	dispatchedAfterFix := make([]string, len(dispatched))
+	copy(dispatchedAfterFix, dispatched)
+	mu.Unlock()
+
+	thinkerDispatched := false
+	for _, key := range dispatchedAfterFix {
+		if key == thinkerKey {
+			thinkerDispatched = true
+		}
+	}
+	if !thinkerDispatched {
+		t.Errorf("thinker should have been dispatched for re-review after fix done, got: %v", dispatchedAfterFix)
+	}
+}
+
+// TestV10_ReviewReject_ChainIDPropagated verifies that fix and re-review tasks
+// inherit the chain_id from the original review task.
+func TestV10_ReviewReject_ChainIDPropagated(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create chain with known chain_id.
+	chainResp := postJSON(t, srv, "/dispatch/chain", map[string]any{
+		"tasks": []map[string]any{
+			{"title": "step-1", "assigned_to": "coder"},
+			{"title": "step-2-review", "assigned_to": "thinker"},
+		},
+	})
+	var cr model.ChainResponse
+	json.NewDecoder(chainResp.Body).Decode(&cr) //nolint:errcheck
+	chainResp.Body.Close()
+
+	chainID := cr.ChainID
+	implTask := cr.Tasks[0]
+	reviewTask := cr.Tasks[1]
+
+	// Drive impl to done.
+	driveTaskToDone(t, srv, implTask.ID, implTask.Version, "coder")
+	time.Sleep(50 * time.Millisecond)
+
+	// Fail review → two-stage.
+	patchTaskToFailed(t, srv, reviewTask.ID, reviewTask.Version, "thinker",
+		"REQUEST_CHANGES | retry_assigned_to: coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify fix and re-review have the same chain_id.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	for _, t2 := range listBody.Tasks {
+		if strings.HasPrefix(t2.Title, "fix:") || strings.HasPrefix(t2.Title, "re-review:") {
+			if t2.ChainID != chainID {
+				t.Errorf("task %q (title=%q) should have chain_id=%q, got %q",
+					t2.ID, t2.Title, chainID, t2.ChainID)
+			}
+		}
+	}
+}
+
+// -------------------------------------------------------------------
+// V10.1: vision/pm/ops retry_routing coverage
+// -------------------------------------------------------------------
+
+// TestV10_RetryRouting_VisionDefault_Coder verifies vision catch-all routes to coder.
+func TestV10_RetryRouting_VisionDefault_Coder(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// vision task fails with no "设计" keyword → catch-all → coder.
+	var task model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "vision-check", "assigned_to": "vision"})
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	patchTaskToFailed(t, srv, task.ID, task.Version, "vision",
+		"实现有问题 | retry_assigned_to: coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// vision != coder → isReviewReject → two-stage chain (fix + re-review).
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fixTask *model.Task
+	for i := range listBody.Tasks {
+		if strings.HasPrefix(listBody.Tasks[i].Title, "fix:") {
+			fixTask = &listBody.Tasks[i]
+			break
+		}
+	}
+	if fixTask == nil {
+		t.Fatal("vision default route should create a fix task (via review-reject)")
+	}
+	if fixTask.AssignedTo != "coder" {
+		t.Fatalf("fix task should be assigned to coder, got %q", fixTask.AssignedTo)
+	}
+}
+
+// TestV10_RetryRouting_VisionDesign_UIUX verifies vision + "设计" keyword routes to uiux.
+func TestV10_RetryRouting_VisionDesign_UIUX(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// vision task fails with "设计" keyword → priority match → uiux.
+	var task model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "vision-design", "assigned_to": "vision"})
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	patchTaskToFailed(t, srv, task.ID, task.Version, "vision",
+		"设计风格不对 | retry_assigned_to: uiux")
+	time.Sleep(200 * time.Millisecond)
+
+	// vision != uiux → isReviewReject → two-stage chain.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fixTask, reReviewTask *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "fix:") {
+			fixTask = t2
+		}
+		if strings.HasPrefix(t2.Title, "re-review:") {
+			reReviewTask = t2
+		}
+	}
+	if fixTask == nil {
+		t.Fatal("vision+设计 route should create a fix task")
+	}
+	if fixTask.AssignedTo != "uiux" {
+		t.Fatalf("fix task should be assigned to uiux, got %q", fixTask.AssignedTo)
+	}
+	if reReviewTask == nil {
+		t.Fatal("vision+设计 route should create a re-review task")
+	}
+	if reReviewTask.AssignedTo != "vision" {
+		t.Fatalf("re-review should be assigned back to vision, got %q", reReviewTask.AssignedTo)
+	}
+}
+
+// TestV10_RetryRouting_PM_Thinker verifies pm catch-all routes to thinker.
+func TestV10_RetryRouting_PM_Thinker(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// pm task fails → catch-all → thinker.
+	var task model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "pm-task", "assigned_to": "pm"})
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	patchTaskToFailed(t, srv, task.ID, task.Version, "pm", "需求不清晰")
+	time.Sleep(200 * time.Millisecond)
+
+	// pm is NOT in isReviewReject list → standard single retry.
+	listResp := getJSON(t, srv, "/tasks?assigned_to=thinker")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var retryTask *model.Task
+	for i := range listBody.Tasks {
+		if strings.HasPrefix(listBody.Tasks[i].Title, "retry:") {
+			retryTask = &listBody.Tasks[i]
+			break
+		}
+	}
+	if retryTask == nil {
+		t.Fatal("pm catch-all should create a retry task for thinker")
+	}
+	if retryTask.AssignedTo != "thinker" {
+		t.Fatalf("retry task should be assigned to thinker, got %q", retryTask.AssignedTo)
+	}
+}
+
+// TestV10_RetryRouting_Ops_Devops verifies ops catch-all routes to devops.
+func TestV10_RetryRouting_Ops_Devops(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// ops task fails → catch-all → devops.
+	var task model.Task
+	r := postJSON(t, srv, "/tasks", map[string]any{"title": "ops-task", "assigned_to": "ops"})
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	patchTaskToFailed(t, srv, task.ID, task.Version, "ops", "部署失败")
+	time.Sleep(200 * time.Millisecond)
+
+	// ops is NOT in isReviewReject list → standard single retry.
+	listResp := getJSON(t, srv, "/tasks?assigned_to=devops")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var retryTask *model.Task
+	for i := range listBody.Tasks {
+		if strings.HasPrefix(listBody.Tasks[i].Title, "retry:") {
+			retryTask = &listBody.Tasks[i]
+			break
+		}
+	}
+	if retryTask == nil {
+		t.Fatal("ops catch-all should create a retry task for devops")
+	}
+	if retryTask.AssignedTo != "devops" {
+		t.Fatalf("retry task should be assigned to devops, got %q", retryTask.AssignedTo)
+	}
+}
+
+// TestV10_VisionReviewReject_TwoStageChain verifies that vision as a reviewer
+// triggers isReviewReject two-stage chain (fix + re-review) when retry goes to
+// a different agent.
+func TestV10_VisionReviewReject_TwoStageChain(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create chain: coder → vision(review) → qa
+	chainResp := postJSON(t, srv, "/dispatch/chain", map[string]any{
+		"tasks": []map[string]any{
+			{"title": "impl-feature", "assigned_to": "coder"},
+			{"title": "visual-review", "assigned_to": "vision"},
+			{"title": "final-qa", "assigned_to": "qa"},
+		},
+	})
+	if chainResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", chainResp.StatusCode)
+	}
+	var cr model.ChainResponse
+	json.NewDecoder(chainResp.Body).Decode(&cr) //nolint:errcheck
+	chainResp.Body.Close()
+
+	implTask := cr.Tasks[0]
+	reviewTask := cr.Tasks[1]
+	qaTask := cr.Tasks[2]
+
+	// Drive impl to done.
+	driveTaskToDone(t, srv, implTask.ID, implTask.Version, "coder")
+	time.Sleep(50 * time.Millisecond)
+
+	// vision rejects → retry to coder (vision != coder → isReviewReject).
+	patchTaskToFailed(t, srv, reviewTask.ID, reviewTask.Version, "vision",
+		"UI实现有偏差 | retry_assigned_to: coder")
+	time.Sleep(200 * time.Millisecond)
+
+	// Find fix and re-review tasks.
+	listResp := getJSON(t, srv, "/tasks")
+	var listBody struct {
+		Tasks []model.Task `json:"tasks"`
+	}
+	json.NewDecoder(listResp.Body).Decode(&listBody) //nolint:errcheck
+	listResp.Body.Close()
+
+	var fixTask, reReviewTask *model.Task
+	for i := range listBody.Tasks {
+		t2 := &listBody.Tasks[i]
+		if strings.HasPrefix(t2.Title, "fix:") {
+			fixTask = t2
+		}
+		if strings.HasPrefix(t2.Title, "re-review:") {
+			reReviewTask = t2
+		}
+	}
+
+	// Verify two tasks created.
+	if fixTask == nil {
+		t.Fatal("vision review-reject should create a fix task")
+	}
+	if reReviewTask == nil {
+		t.Fatal("vision review-reject should create a re-review task")
+	}
+
+	// fix → coder, re-review → vision.
+	if fixTask.AssignedTo != "coder" {
+		t.Fatalf("fix task should be assigned to coder, got %q", fixTask.AssignedTo)
+	}
+	if reReviewTask.AssignedTo != "vision" {
+		t.Fatalf("re-review should be assigned back to vision, got %q", reReviewTask.AssignedTo)
+	}
+
+	// Verify original review's superseded_by → re-review (not fix).
+	reviewDetail := getJSON(t, srv, "/tasks/"+reviewTask.ID)
+	var rvDetail model.Task
+	json.NewDecoder(reviewDetail.Body).Decode(&rvDetail) //nolint:errcheck
+	reviewDetail.Body.Close()
+	if rvDetail.SupersededBy != reReviewTask.ID {
+		t.Fatalf("original review.superseded_by should point to re-review %q, got %q",
+			reReviewTask.ID, rvDetail.SupersededBy)
+	}
+
+	// qa should NOT be deps_met yet.
+	depsResp := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm model.DepsMet
+	json.NewDecoder(depsResp.Body).Decode(&dm) //nolint:errcheck
+	depsResp.Body.Close()
+	if dm.DepsMet {
+		t.Fatal("qa should NOT be deps_met while vision re-review is pending")
+	}
+
+	// Drive fix → done, then re-review → done.
+	driveTaskToDone(t, srv, fixTask.ID, fixTask.Version, "coder")
+	time.Sleep(100 * time.Millisecond)
+
+	rrLatest := getJSON(t, srv, "/tasks/"+reReviewTask.ID)
+	var rrDetail model.Task
+	json.NewDecoder(rrLatest.Body).Decode(&rrDetail) //nolint:errcheck
+	rrLatest.Body.Close()
+
+	driveTaskToDone(t, srv, reReviewTask.ID, rrDetail.Version, "vision")
+	time.Sleep(100 * time.Millisecond)
+
+	// NOW qa should be deps_met.
+	depsResp2 := getJSON(t, srv, "/tasks/"+qaTask.ID+"/deps-met")
+	var dm2 model.DepsMet
+	json.NewDecoder(depsResp2.Body).Decode(&dm2) //nolint:errcheck
+	depsResp2.Body.Close()
+	if !dm2.DepsMet {
+		t.Fatal("qa should be deps_met after vision re-review is done")
 	}
 }
