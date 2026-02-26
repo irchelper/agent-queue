@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS retry_routing (
   assigned_to       TEXT NOT NULL,
   error_keyword     TEXT NOT NULL DEFAULT '',
   retry_assigned_to TEXT NOT NULL,
-  priority          INTEGER NOT NULL DEFAULT 0
+  priority          INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(assigned_to, error_keyword)
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -86,6 +87,13 @@ func Open(path string) (*sql.DB, error) {
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN notify_ceo_on_complete INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN stale_dispatch_count INTEGER NOT NULL DEFAULT 0`)
 
+	// Deduplicate retry_routing: keep the earliest row per (assigned_to, error_keyword) pair,
+	// then add a UNIQUE index so INSERT OR IGNORE works correctly going forward.
+	if err = deduplicateRetryRouting(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("deduplicate retry_routing: %w", err)
+	}
+
 	// Seed retry_routing initial data (idempotent: only insert if table is empty).
 	if err = seedRetryRouting(db); err != nil {
 		db.Close()
@@ -101,16 +109,32 @@ func Open(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// seedRetryRouting inserts the default 9-expert routing rules if the table is empty.
-func seedRetryRouting(db *sql.DB) error {
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM retry_routing`).Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 {
-		return nil // already seeded
+// deduplicateRetryRouting removes duplicate rows in retry_routing (keeping the earliest per
+// (assigned_to, error_keyword) pair) and creates a UNIQUE index so that subsequent
+// INSERT OR IGNORE calls are actually idempotent.
+func deduplicateRetryRouting(db *sql.DB) error {
+	// Delete duplicates – keep the row with the lowest id for each unique key.
+	_, err := db.Exec(`
+		DELETE FROM retry_routing
+		WHERE id NOT IN (
+			SELECT MIN(id) FROM retry_routing GROUP BY assigned_to, error_keyword
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("deduplicate rows: %w", err)
 	}
 
+	// Create a unique index (silently ignored if it already exists).
+	_, err = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_retry_routing_key ON retry_routing(assigned_to, error_keyword)`)
+	if err != nil {
+		return fmt.Errorf("create unique index: %w", err)
+	}
+
+	return nil
+}
+
+// seedRetryRouting inserts the default 12-expert routing rules (idempotent via INSERT OR IGNORE).
+func seedRetryRouting(db *sql.DB) error {
 	rules := []struct {
 		assignedTo      string
 		errorKeyword    string
@@ -133,7 +157,7 @@ func seedRetryRouting(db *sql.DB) error {
 
 	for _, r := range rules {
 		_, err := db.Exec(
-			`INSERT INTO retry_routing (assigned_to, error_keyword, retry_assigned_to, priority) VALUES (?, ?, ?, ?)`,
+			`INSERT OR IGNORE INTO retry_routing (assigned_to, error_keyword, retry_assigned_to, priority) VALUES (?, ?, ?, ?)`,
 			r.assignedTo, r.errorKeyword, r.retryAssignedTo, r.priority)
 		if err != nil {
 			return err
