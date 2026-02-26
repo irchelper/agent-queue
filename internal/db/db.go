@@ -164,6 +164,27 @@ func addRetryRoutingRules(db *sql.DB) error {
 			return err
 		}
 	}
+
+	// V10.1 视觉验收 + PM/Ops 补全（2026-02-26）
+	v10Rules := []struct {
+		assignedTo      string
+		errorKeyword    string
+		retryAssignedTo string
+		priority        int
+	}{
+		{"vision", "设计", "uiux", 10},  // 视觉验收：设计问题退单 uiux
+		{"vision", "", "coder", 0},      // 视觉验收：默认退单 coder
+		{"pm", "", "thinker", 0},        // 需求问题升级架构
+		{"ops", "", "devops", 0},        // 运维问题转 devops
+	}
+	for _, r := range v10Rules {
+		_, err := db.Exec(
+			`INSERT OR IGNORE INTO retry_routing (assigned_to, error_keyword, retry_assigned_to, priority) VALUES (?, ?, ?, ?)`,
+			r.assignedTo, r.errorKeyword, r.retryAssignedTo, r.priority)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -601,7 +601,7 @@ func (h *Handler) autoRetry(original model.Task, retryAgent string) {
 	// A review reject occurs when the original task was performed by a reviewer
 	// (thinker/security) and the retry is directed to a different agent (the implementer).
 	isReviewReject := original.AssignedTo != retryAgent &&
-		(original.AssignedTo == "thinker" || original.AssignedTo == "security")
+		(original.AssignedTo == "thinker" || original.AssignedTo == "security" || original.AssignedTo == "vision")
 
 	if isReviewReject {
 		h.autoRetryReviewReject(original, origDetail, retryAgent, failureDesc)
