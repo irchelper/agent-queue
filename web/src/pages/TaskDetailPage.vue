@@ -9,6 +9,7 @@ const route = useRoute()
 const router = useRouter()
 const task = ref<Task | null>(null)
 const history = ref<TaskHistory[]>([])
+const chainTasks = ref<Task[]>([])
 const loading = ref(true)
 const error = ref<string | null>(null)
 
@@ -21,11 +22,48 @@ async function load() {
     task.value = resp.task
     // Reverse so newest first
     history.value = [...(resp.history ?? [])].reverse()
+
+    // V23-B: load chain tasks for inline chain display
+    if (resp.task.chain_id) {
+      try {
+        const graphResp = await fetch(`/api/graph/${encodeURIComponent(resp.task.chain_id)}`)
+        if (graphResp.ok) {
+          const graphData = await graphResp.json()
+          chainTasks.value = graphData.tasks ?? []
+        }
+      } catch {
+        // best-effort — chain display is non-critical
+      }
+    }
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
   }
+}
+
+// V23-B: compute duration for each timeline entry
+// history[] is newest-first; original list is oldest-first → build from reversed
+const historyWithDuration = computed(() => {
+  // oldest-first for duration calc
+  const oldest = [...history.value].reverse()
+  return oldest.map((h, i) => {
+    const prev = oldest[i - 1]
+    let duration = ''
+    if (prev) {
+      const ms = new Date(h.changed_at).getTime() - new Date(prev.changed_at).getTime()
+      if (ms > 0) duration = formatDuration(ms)
+    }
+    return { ...h, duration }
+  }).reverse() // back to newest-first for rendering
+})
+
+function formatDuration(ms: number): string {
+  const totalSec = Math.round(ms / 1000)
+  const m = Math.floor(totalSec / 60)
+  const s = totalSec % 60
+  if (m === 0) return `${s}s`
+  return s === 0 ? `${m}m` : `${m}m ${s}s`
 }
 
 onMounted(load)
@@ -308,26 +346,69 @@ async function updatePriority(value: number) {
         </div>
 
         <!-- Right: Timeline (2/5) -->
-        <div class="col-span-2">
+        <div class="col-span-2 space-y-4">
+          <!-- V23-B: Chain inline (only if chain_id exists and chain has >1 task) -->
+          <div v-if="chainTasks.length > 1" class="bg-gray-900 border border-gray-700 rounded-2xl p-4">
+            <h2 class="text-xs font-semibold text-gray-400 mb-3 flex items-center gap-1.5">
+              🔗 链路任务
+              <span class="text-gray-600 font-normal">{{ task!.chain_id }}</span>
+            </h2>
+            <div class="flex flex-col gap-1">
+              <div
+                v-for="(ct, idx) in chainTasks"
+                :key="ct.id"
+                class="flex items-center gap-1.5"
+              >
+                <!-- Arrow connector (not for first item) -->
+                <span v-if="idx > 0" class="text-gray-600 text-xs shrink-0">↓</span>
+                <span v-else class="w-3 shrink-0"></span>
+                <button
+                  class="flex-1 flex items-center gap-1.5 text-left rounded-lg px-2 py-1.5 transition-colors min-w-0"
+                  :class="ct.id === task!.id
+                    ? 'bg-blue-500/15 border border-blue-500/30'
+                    : 'bg-gray-800 border border-gray-700/50 hover:border-gray-600'"
+                  @click="ct.id !== task!.id && $router.push(`/tasks/${ct.id}`)"
+                >
+                  <span
+                    class="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full border font-medium"
+                    :class="statusColor(ct.status)"
+                  >{{ ct.status }}</span>
+                  <span
+                    class="text-xs truncate"
+                    :class="ct.id === task!.id ? 'text-blue-300 font-medium' : 'text-gray-400'"
+                  >{{ ct.title }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Timeline -->
           <div class="bg-gray-900 border border-gray-700 rounded-2xl p-5">
             <h2 class="text-sm font-semibold text-gray-300 mb-4 flex items-center gap-2">
               <span>⏱</span> 时间线
               <span class="text-xs text-gray-600 font-normal">（最新在上）</span>
             </h2>
 
-            <div v-if="!history.length" class="text-gray-600 text-sm text-center py-6">无记录</div>
+            <div v-if="!historyWithDuration.length" class="text-gray-600 text-sm text-center py-6">无记录</div>
 
             <div class="relative pl-4">
               <!-- Vertical line -->
               <div class="absolute left-1.5 top-2 bottom-2 border-l border-gray-700"></div>
 
-              <div v-for="h in history" :key="h.id" class="mb-4 relative">
+              <div v-for="h in historyWithDuration" :key="h.id" class="mb-4 relative">
                 <!-- Dot -->
                 <div
                   class="absolute -left-4 top-1 w-2.5 h-2.5 rounded-full border-2 border-gray-900"
                   :class="historyDot(h.to_status)"
                 />
-                <div class="text-xs text-gray-600 mb-0.5">{{ formatTime(h.changed_at) }}</div>
+                <div class="flex items-center gap-2 mb-0.5">
+                  <span class="text-xs text-gray-600">{{ formatTime(h.changed_at) }}</span>
+                  <!-- V23-B: duration badge -->
+                  <span
+                    v-if="h.duration"
+                    class="text-[10px] text-gray-500 bg-gray-800 border border-gray-700 rounded px-1 font-mono"
+                  >{{ h.duration }}</span>
+                </div>
                 <div class="text-sm">
                   <span v-if="h.from_status" class="text-gray-500 text-xs">{{ h.from_status }} → </span>
                   <span class="font-medium" :class="historyStatusColor(h.to_status)">{{ h.to_status }}</span>
