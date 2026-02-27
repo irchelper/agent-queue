@@ -2,11 +2,54 @@
 
 # ainative
 
+[![Release](https://img.shields.io/github/v/release/irchelper/ainative?label=release)](https://github.com/irchelper/ainative/releases/tag/v1.0.0)
+[![Go](https://img.shields.io/badge/go-1.22+-00ADD8)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
 **Stop babysitting your AI agents.** ainative is a lightweight task queue with a built-in AI-native workbench UI that lets multiple AI agents coordinate autonomously — no central orchestrator required.
 
 Agents poll for work, claim tasks atomically, and report completion via HTTP. Serial chains run end-to-end without human intervention: when task A finishes, task B unlocks automatically. The next agent picks it up on its next poll cycle.
 
 Single binary. Zero external dependencies. Runs on your laptop.
+
+---
+
+## What's in v1.0.0
+
+**Task Engine**
+- FSM state machine (8 states: pending → claimed → in_progress → done / failed / cancelled / review / blocked)
+- `depends_on` dependency graph — upstream `done` auto-unlocks downstream
+- `POST /dispatch/chain` serial chains; `POST /dispatch/graph` arbitrary DAG dispatch
+- Dynamic priority (`priority`: 0=normal / 1=high / 2=urgent) — `ORDER BY priority DESC`
+- Batch operations (`POST /api/tasks/bulk`: cancel + reassign)
+- Task templates (`POST /dispatch/from-template/:name`)
+- Human approval nodes in chains
+
+**Reliability**
+- RetryQueue with exponential backoff (30s / 60s / 120s)
+- Auto-retry routing table (`retry_routing`) — failed tasks route to the right agent
+- Stale task recovery — unclaimed tasks re-dispatched after configurable threshold
+- Agent timeout auto-fail
+
+**Notifications**
+- CEO chain/task completion via SessionNotifier
+- Discord per-agent webhook routing
+- Outbound webhook (`AGENT_QUEUE_WEBHOOK_URL`) with HMAC-SHA256 signature
+
+**Web UI (AI Workbench)**
+- Dashboard (task cards, search, multi-select bulk ops), Kanban, TaskDetail with timeline + chain inline view
+- DAG visualization (`/graph`) — Kahn BFS level layout, status-color nodes
+- Agent stats panel (`/stats`) — success rate, avg duration, progress bars
+- Settings page (`/settings`) — webhook status, system info
+- Task comments — threaded, SSE real-time, `Ctrl+Enter` submit
+- i18n Chinese/English toggle (vue-i18n@9, localStorage persistence)
+- Mobile responsive — hamburger menu, breakpoint grid
+
+**API & Docs**
+- Scalar interactive API docs at `GET /docs` (OpenAPI 3.1, 18 endpoints)
+- SSE real-time updates (`GET /events`)
+- `GET /api/agents/stats` — per-agent aggregated metrics
+- `GET /api/graph/:chain_id` — DAG graph data
 
 ---
 

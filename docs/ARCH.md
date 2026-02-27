@@ -1349,3 +1349,1125 @@ timeouts:
 | 任务未被认领（pending 超时）| pending | re-dispatch（已有，V11）|
 | agent 认领后无响应（in_progress 超时）| in_progress | PATCH failed → retry/CEO（V16 新增）|
 | 人工任务超时 | in_progress（human）| 不处理（CEO 负责）|
+
+---
+
+## V17 — SSE 实时更新（2026-02-27）
+
+> commit: `9d6b3c9`
+
+### 设计背景
+
+Web UI 初始版本依赖客户端轮询（每 10-60s 一次）获取任务状态变更。轮询存在两个问题：
+1. **延迟**：最多需要等待一个完整轮询周期才能感知变更
+2. **无效请求**：无事件时仍产生大量 HTTP 请求
+
+V17 引入 SSE（Server-Sent Events）推送机制，Go server 在任务状态变更时主动推送事件，前端实时更新 UI。
+
+### Go 后端：SSEHub
+
+**新增文件：** `internal/handler/sse.go`（~80 行）
+
+```go
+type SSEHub struct {
+    clients    map[chan []byte]struct{}  // 已连接的 SSE 客户端
+    register   chan chan []byte          // 注册新客户端
+    unregister chan chan []byte          // 注销断开的客户端
+    broadcast  chan []byte              // 广播事件数据
+}
+
+func NewSSEHub() *SSEHub
+func (h *SSEHub) Run()                             // goroutine：管理 clients map
+func (h *SSEHub) Broadcast(event string, data any) // 序列化并广播 SSE 事件
+```
+
+**SSE 端点：** `GET /api/events`
+
+```
+Response headers:
+  Content-Type: text/event-stream
+  Cache-Control: no-cache
+  Connection: keep-alive
+
+事件格式：
+  event: task_updated
+  data: {"id":"...","status":"done","result":"...","updated_at":"..."}
+```
+
+**4 种事件类型：**
+
+| 事件名 | 触发时机 | data 字段 |
+|--------|---------|-----------|
+| `task_updated` | PATCH /tasks/:id 任何状态变更 | task 完整对象 |
+| `task_created` | POST /tasks 或 POST /dispatch 创建 | task 完整对象 |
+| `task_failed` | PATCH status=failed | task + failure_reason |
+| `chain_completed` | chain 所有任务 done | chain_id + tasks 摘要数组 |
+
+**广播插入点（handler.go）：**
+
+```go
+// PATCH /tasks/:id done → task_updated
+h.hub.Broadcast("task_updated", task)
+
+// PATCH /tasks/:id failed → task_failed
+h.hub.Broadcast("task_failed", task)
+
+// POST /dispatch → task_created
+h.hub.Broadcast("task_created", task)
+
+// POST /dispatch/chain → task_created（每个子任务）
+for _, t := range created {
+    h.hub.Broadcast("task_created", t)
+}
+
+// chain_completed（OnChainComplete 触发）
+h.hub.Broadcast("chain_completed", chainSummary)
+```
+
+### Vue 前端：useSSE Composable
+
+**新增文件：** `web/src/composables/useSSE.ts`
+
+```ts
+function useSSE(url: string, options?: SSEOptions) {
+  // 1. 建立 EventSource 连接
+  // 2. 监听各类事件，更新 Pinia store
+  // 3. 断线自动重连（指数退避：1s → 2s → 4s → 8s，最大 30s）
+  // 4. fallback：SSE 不可用时降级为轮询（保持原有 usePolling 逻辑）
+  // 5. 页面隐藏时关闭连接，可见时重连
+}
+```
+
+**集成页面：**
+
+| 页面 | 集成方式 | 降级行为 |
+|------|---------|---------|
+| DashboardPage | useSSE 替换 usePolling（任务状态实时刷新）| 降级为 10s 轮询 |
+| KanbanPage | useSSE 更新列状态（任务移列动画）| 降级为 60s 轮询 |
+
+**Pinia store 更新逻辑（taskStore.ts）：**
+
+```ts
+// SSE 事件处理
+onSSEEvent('task_updated', (task) => {
+    taskStore.upsert(task)         // 原地更新，不刷新整个列表
+})
+onSSEEvent('task_created', (task) => {
+    taskStore.prepend(task)        // 插入到列表顶部
+})
+onSSEEvent('chain_completed', (summary) => {
+    chainStore.markComplete(summary.chain_id)
+})
+```
+
+### 连接管理
+
+**并发连接限制：** 无显式上限（SSEHub 使用 Go channel，天然背压）；预期并发用户极少（自用工具），不需要限流。
+
+**连接心跳：** Go server 每 30s 发送一次 SSE comment（`: heartbeat`），防止代理/负载均衡断开空闲连接。
+
+**断线重连策略（前端）：**
+
+```
+连接断开 → 等待 1s → 重连
+再次断开 → 等待 2s → 重连
+... 指数退避（最大 30s）
+连接成功 → 重置退避计数
+```
+
+重连期间自动切换为轮询，确保数据不中断。
+
+### 与轮询的共存策略
+
+SSE 和轮询不互斥，作为补充：
+
+| 机制 | 触发时机 | 覆盖场景 |
+|------|---------|---------|
+| SSE（push） | 服务端状态变更时立即推送 | 正常情况，低延迟更新 |
+| 轮询（pull） | SSE 断线期间 / 页面加载初始化 | 断线恢复 / 全量数据同步 |
+
+**初始加载仍用 REST API**（GET /tasks）获取全量数据，SSE 只推送增量变更。
+
+---
+
+## V18 — /dispatch/graph DAG API + 任务搜索过滤（2026-02-27）
+
+> commit: `b82b369`
+
+### 功能 A：POST /dispatch/graph（DAG 任务图派发）
+
+#### 设计动机
+
+`POST /dispatch/chain` 只支持线性串行链（A→B→C）。真实项目中常有并行+汇聚结构，例如"先 coder+security 并行，两者都完成后 qa 开始"。V18 引入 DAG API，支持任意有向无环图拓扑。
+
+#### 请求格式
+
+```json
+POST /dispatch/graph
+{
+  "nodes": [
+    {"id": "n1", "title": "实现登录功能", "assigned_to": "coder"},
+    {"id": "n2", "title": "安全审计", "assigned_to": "security"},
+    {"id": "n3", "title": "集成测试", "assigned_to": "qa"}
+  ],
+  "edges": [
+    {"from": "n1", "to": "n3"},
+    {"from": "n2", "to": "n3"}
+  ],
+  "notify_ceo_on_complete": true,
+  "chain_title": "登录功能开发+安全审计"
+}
+```
+
+- `nodes[].id`：客户端本地引用 ID（字符串）
+- `edges`：有向边，`from → to` 表示"from 完成后 to 才能开始"
+- `notify_ceo_on_complete` + `chain_title`：与 dispatch/chain 一致
+
+#### 响应格式
+
+```json
+{
+  "chain_id": "chain_xxx",
+  "task_map": {
+    "n1": "1897xxxx",
+    "n2": "1897yyyy",
+    "n3": "1897zzzz"
+  },
+  "dispatched": ["1897xxxx", "1897yyyy"]  // 无前置依赖、已唤醒的节点
+}
+```
+
+#### 实现：Kahn 拓扑排序
+
+```
+1. 验证 DAG（无环检测）：
+   - 构建入度表：每个节点统计 in_degree
+   - BFS（Kahn）：从 in_degree=0 节点开始逐层展开
+   - 若最终处理节点数 < 总节点数 → 存在环，返回 400
+
+2. 事务内原子创建所有任务（store.CreateGraph）：
+   - 本地 id → 生成 task_id（ULID）
+   - edges → 转换为 task_id 级 depends_on 关系
+   - 所有任务同一 chain_id
+
+3. Dispatch 入度=0 的节点（无前置依赖）：
+   - SessionNotifier.Dispatch(assignedTo, taskID) 唤醒各 agent
+   - 后续节点由 unlockDependents 机制自动解锁（现有逻辑）
+```
+
+#### 与 dispatch/chain 的关系
+
+| API | 拓扑结构 | 适用场景 |
+|-----|---------|---------|
+| `POST /dispatch/chain` | 线性串行（A→B→C） | 已知顺序的标准流程 |
+| `POST /dispatch/graph` | 任意 DAG | 含并行/汇聚的复杂任务图 |
+
+`dispatch/chain` 是 `dispatch/graph` 的线性退化形式，两者底层共用 `CreateGraph` 事务方法。
+
+---
+
+### 功能 B：GET /tasks 搜索过滤扩展
+
+#### 新增过滤参数
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `status` | string | 按状态过滤（已有）|
+| `assigned_to` | string | 按 agent 名过滤（已有）|
+| `search` | string | **新增**：全文搜索 title + description（SQLite LIKE）|
+
+#### 搜索实现
+
+```sql
+-- GET /tasks?search=登录&status=in_progress
+SELECT * FROM tasks
+WHERE (title LIKE '%登录%' OR description LIKE '%登录%')
+  AND status = 'in_progress'
+ORDER BY priority DESC, created_at DESC
+```
+
+- 大小写不敏感（SQLite LIKE 默认行为）
+- `search` 为空时跳过 LIKE 子句，行为与原来完全一致（向后兼容）
+- 不引入 FTS5（任务数量小，LIKE 足够；FTS5 增加维护复杂度）
+
+#### 已知缺陷（后续修复）
+
+**`GET /tasks/summary?assigned_to=` 过滤未实现：**
+
+`/tasks/summary` 返回全局统计（各状态计数 + 活跃任务列表），当前不支持按 `assigned_to` 过滤。前端"按 agent 查看统计"功能需等待后续修复。
+
+临时方案：客户端用 `GET /tasks?assigned_to=X` 列表接口自行聚合统计。
+
+---
+
+## V19 Summary 过滤修复 + 动态优先级 (commit: 57c8fe1)
+
+### 背景
+
+V18 引入搜索过滤时，发现 `GET /tasks/summary` 不支持 `assigned_to` 过滤（已在 V18 末尾记录为"已知缺陷"）。V19 完成该修复，并同步新增动态优先级功能（P1）。
+
+---
+
+### 功能 A（P0）：GET /tasks/summary?assigned_to= 过滤修复
+
+#### 问题
+
+`/tasks/summary` 原实现调用 `store.Summary()`，返回全局统计：
+- 各状态计数（pending/claimed/in_progress/done/failed）
+- 今日完成数（done_today）
+- 活跃任务列表（active tasks）
+
+Handler 忽略 HTTP 请求参数（`_ *http.Request`），无法按 agent 过滤。
+
+#### 修复方案
+
+**新增 `store.SummaryFiltered(assignedTo string)`：**
+
+```go
+// store.go
+func (s *Store) SummaryFiltered(assignedTo string) (SummaryResult, error) {
+    // 所有计数查询均附加 WHERE assigned_to = ?（assignedTo 非空时）
+    // assignedTo = "" 时退化为全局统计（兼容原 Summary() 行为）
+}
+```
+
+- 原 `store.Summary()` 改为调用 `SummaryFiltered("")`，行为不变（向后兼容）
+- 各状态计数、done_today、active tasks 列表均支持 assigned_to 过滤
+
+**Handler 读取请求参数：**
+
+```go
+// handler.go
+func (h *Handler) tasksSummary(w http.ResponseWriter, r *http.Request) {
+    assignedTo := r.URL.Query().Get("assigned_to")
+    result, err := h.store.SummaryFiltered(assignedTo)
+    // ...
+}
+```
+
+#### API 示例
+
+```http
+# 全局统计（原行为）
+GET /tasks/summary
+
+# 按 agent 过滤
+GET /tasks/summary?assigned_to=coder
+GET /tasks/summary?assigned_to=qa
+```
+
+响应结构不变，仅数据范围缩小为指定 agent 的任务。
+
+---
+
+### 功能 B（P1）：PATCH /tasks/:id 动态优先级
+
+#### 设计
+
+新增优先级字段，支持任务派发后动态调整：
+
+| 值 | 常量 | 含义 |
+|----|------|------|
+| `0` | normal | 普通（默认）|
+| `1` | high | 高优先级 |
+| `2` | urgent | 紧急 |
+
+#### 数据层
+
+```go
+// model.go
+type PatchTaskRequest struct {
+    Status      string `json:"status,omitempty"`
+    Result      string `json:"result,omitempty"`
+    Version     int    `json:"version"`
+    Priority    *int   `json:"priority,omitempty"` // 指针：nil 表示不更新
+}
+```
+
+`store.PatchTask()` 检测 `req.Priority != nil`，追加 `SET priority = ?`：
+- **绕过 FSM 状态检查**：优先级更新不经过状态机，任意状态均可更新
+- `PATCH /tasks/:id` 响应体包含完整 task 对象（含新 priority + 最新 version）
+
+#### 排序变更
+
+```sql
+-- GET /tasks 及内部列表查询
+ORDER BY priority DESC, created_at ASC
+```
+
+高优先级任务在列表头部；相同优先级时按创建时间升序（FIFO）。
+
+#### 前端（TaskDetailPage.vue）
+
+三档优先级按钮组：
+
+```
+[ 普通 ]  [ 高 ]  [ 紧急 ]
+```
+
+- 点击后 PATCH `{priority: 0|1|2}`，响应体刷新本地 `task.version`
+- 按钮高亮当前选中档位
+
+---
+
+### 验证
+
+```
+go test -race ./... ✅
+npm run build ✅
+```
+
+---
+
+## V20 Scalar API 文档 + DAG 可视化 (commit: 30eefb3)
+
+### 背景
+
+V20 新增两个独立功能：
+- **P0**：Scalar API 文档页，让外部开发者无需查阅源码即可了解所有接口
+- **P1**：DAG 可视化页面，让 CEO/agent 直观看到任务链路的拓扑结构与执行状态
+
+---
+
+### 功能 A（P0）：GET /docs Scalar API 文档集成
+
+#### 实现方案
+
+通过 CDN 集成 [Scalar](https://scalar.com/)，无需在项目中维护额外 UI 依赖：
+
+```
+GET /docs        → 返回 Scalar HTML（CDN 加载，data-url=/openapi.json）
+GET /openapi.json → 返回内联 OpenAPI 3.1 spec
+```
+
+实现文件：`internal/handler/docs.go`（284 行），包含：
+1. OpenAPI 3.1 spec 硬编码（内联，无外部文件依赖）
+2. Scalar HTML 模板（CDN 引用 `@scalar/api-reference`）
+
+#### OpenAPI Spec 覆盖范围
+
+共 **18 个端点路径**，按模块分组：
+
+| 模块 | 端点 |
+|------|------|
+| Tasks | `GET /tasks`, `POST /tasks`, `GET /tasks/{id}`, `PATCH /tasks/{id}`, `POST /tasks/{id}/claim`, `GET /tasks/poll`, `GET /tasks/summary` |
+| Dispatch | `POST /dispatch`, `POST /dispatch/chain`, `POST /dispatch/graph` |
+| Templates | `GET /templates`, `POST /templates`, `GET /templates/{id}`, `DELETE /templates/{id}` |
+| Routing | `GET /routing`, `POST /routing`, `DELETE /routing/{agent}` |
+| SSE | `GET /events` |
+| Graph | `GET /api/graph/{chain_id}` |
+
+**components/schemas** 定义 6 种请求体结构：
+- `CreateTaskRequest`
+- `PatchTaskRequest`（含 `priority *int`）
+- `ClaimTaskRequest`
+- `DispatchRequest`
+- `DispatchChainRequest`
+- `DispatchGraphRequest`
+
+#### 设计决策
+
+- **内联 spec vs 文件**：spec 硬编码在 Go 源文件中，通过 `embed.FS` 或直接 `[]byte` 返回，不引入额外构建步骤
+- **Scalar vs Swagger UI**：Scalar 提供更现代的 UI，CDN 引入零配置，与项目无 npm 依赖耦合
+
+---
+
+### 功能 B（P1）：GET /api/graph/:chain_id + DAG 可视化页面
+
+#### 新端点：GET /api/graph/:chain_id
+
+返回指定链路的任务节点与依赖关系：
+
+```json
+{
+  "tasks": [
+    {
+      "id": "abc123",
+      "title": "coder 实现登录",
+      "status": "done",
+      "assigned_to": "coder",
+      "depends_on": []
+    },
+    {
+      "id": "def456",
+      "title": "qa 验证登录",
+      "status": "in_progress",
+      "assigned_to": "qa",
+      "depends_on": ["abc123"]
+    }
+  ]
+}
+```
+
+`Task` 类型新增 `depends_on?: string[]` 字段（`web/src/types/index.ts`）。
+
+#### 前端：GraphVisualizationPage.vue
+
+**布局结构：**
+```
+┌─────────────────────────────────┐
+│  顶部统计栏                       │
+│  总数 N / 完成 X / 进行中 Y / ...  │
+├─────────────────────────────────┤
+│  链路选择器（chain_id 下拉/输入）   │
+├─────────────────────────────────┤
+│  DAG 拓扑图（左→右分层布局）        │
+│                                 │
+│  [节点] → [节点] → [节点]          │
+├─────────────────────────────────┤
+│  底部图例                         │
+│  ● 灰=待处理 ● 黄=已认领 ...       │
+└─────────────────────────────────┘
+```
+
+**层级计算（Kahn BFS 算法）：**
+
+```
+1. 构建入度表（in-degree map）
+2. 将入度=0 的节点加入队列，层级设为 0
+3. BFS 展开：每处理一个节点，将其后继节点入度减 1
+4. 入度降为 0 时，后继节点层级 = 当前节点层级 + 1
+5. 同层节点在同一列渲染
+```
+
+**节点颜色（按状态）：**
+
+| 状态 | 颜色 |
+|------|------|
+| `pending` | 灰色 |
+| `claimed` | 黄色 |
+| `in_progress` | 蓝色 |
+| `done` | 绿色 |
+| `failed` | 红色 |
+
+**交互：**
+- 点击节点 → 跳转 `TaskDetailPage`（`/tasks/:id`）
+
+**路由与导航：**
+- 路由：`/graph` → `GraphVisualizationPage`（`web/src/router/index.ts`）
+- `AppLayout.vue` 导航栏新增 `🕸 DAG` 入口
+
+---
+
+### 验证
+
+```
+go test -race ./... ✅
+npm run build ✅（8 chunk）
+```
+
+---
+
+## V21 搜索 UI + Agent 统计面板 (commit: db19a8b)
+
+### 背景
+
+V21 在已有搜索后端能力（V18 `GET /tasks?search=`）的基础上，补全前端搜索交互；同时新增 Agent 统计面板，让 CEO 可实时查看各 agent 的任务完成率与效率。
+
+---
+
+### 功能 A（P0）：DashboardPage 搜索栏
+
+#### 交互设计
+
+搜索栏插入位置：Error banner 与主任务 grid 之间。
+
+```
+┌────────────────────────────────────┐
+│  Error banner（如有）               │
+├────────────────────────────────────┤
+│  🔍 搜索任务...           [✕]       │  ← 新增
+├────────────────────────────────────┤
+│  任务卡片 grid                      │
+└────────────────────────────────────┘
+```
+
+**搜索结果 overlay（绝对定位）：**
+
+```
+┌──────────────────────────────┐
+│  [done] coder 实现登录功能    │  ← 状态 badge + 标题 + agent
+│  [in_progress] qa 验证登录   │
+│  ...                         │
+│  共 N 个结果                  │  ← 页脚
+└──────────────────────────────┘
+```
+
+- 点击结果项 → 跳转 `/tasks/:id`，搜索框自动清空
+- `[✕]` 清空按钮；无结果时显示"未找到相关任务"提示
+
+#### 实现细节
+
+**debounce 300ms（客户端过滤）：**
+
+```js
+// DashboardPage.vue
+watch(searchQuery, (val) => {
+  clearTimeout(searchTimer)
+  if (!val.trim()) { searchResults.value = []; return }
+  searchTimer = setTimeout(() => doSearch(val), 300)
+})
+
+function doSearch(query) {
+  // 复用已拉取的本地任务列表，过滤 title + description
+  // 无需后端额外改动（V18 后端搜索能力已存在）
+  searchResults.value = tasks.value.filter(t =>
+    t.title.includes(query) || (t.description ?? '').includes(query)
+  )
+}
+```
+
+**设计决策**：客户端过滤（而非调用 `GET /tasks?search=`）可减少网络请求，适合任务数量有限的场景；列表已在 DashboardPage 缓存，无额外开销。
+
+---
+
+### 功能 B（P1）：GET /api/agents/stats + AgentStatsPage
+
+#### 新端点：GET /api/agents/stats
+
+按 `assigned_to` 聚合任务统计：
+
+```sql
+SELECT
+  assigned_to,
+  COUNT(*) AS total_tasks,
+  SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_count,
+  SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+  AVG(
+    (julianday(updated_at) - julianday(started_at)) * 24 * 60
+  ) AS avg_duration_minutes,
+  ROUND(
+    done_count * 100.0 / NULLIF(done_count + failed_count, 0), 1
+  ) AS success_rate
+FROM tasks
+WHERE started_at IS NOT NULL
+GROUP BY assigned_to
+ORDER BY total_tasks DESC
+```
+
+响应示例：
+
+```json
+[
+  {
+    "agent": "coder",
+    "total_tasks": 42,
+    "done_count": 38,
+    "failed_count": 2,
+    "avg_duration_minutes": 12.5,
+    "success_rate": 95.0
+  }
+]
+```
+
+实际生产验收：`/api/agents/stats` 返回 15 个 agents ✅
+
+#### 前端：AgentStatsPage.vue
+
+**布局：** 响应式卡片网格（小屏1列 / 中屏2列 / 大屏3列）
+
+每张 agent 卡片结构：
+
+```
+┌────────────────────────┐
+│  🤖 coder              │
+│  总任务：42             │
+│  ████████████░░  95%   │  ← 完成率进度条
+│  完成: 38  失败: 2      │
+│  平均耗时: 12.5 分钟    │
+└────────────────────────┘
+```
+
+**进度条颜色阈值：**
+
+| 完成率 | 颜色 |
+|--------|------|
+| ≥ 80% | 绿色 |
+| ≥ 50% | 黄色 |
+| < 50% | 红色 |
+
+**路由与导航：**
+- 路由：`/stats` → `AgentStatsPage`（`web/src/router/index.ts`）
+- `AppLayout.vue` 导航栏新增 `📊 统计` 入口
+
+---
+
+### 验证
+
+```
+go test -race ./... ✅
+npm run build ✅（9 chunk）
+make build + restart：/api/agents/stats 返回 15 个 agents ✅
+```
+
+---
+
+## V22 批量操作 + 移动端响应式 (commit: d2d33b4)
+
+### 背景
+
+V22 针对两个独立需求：
+- **P0**：CEO 需要对异常任务（failed/stuck）进行批量运维操作（取消/重新分配），逐条操作效率太低
+- **P1**：Web UI 在移动端布局破损，需要补全响应式支持
+
+---
+
+### 功能 A（P0）：POST /api/tasks/bulk 批量操作
+
+#### 端点设计
+
+```http
+POST /api/tasks/bulk
+Content-Type: application/json
+
+{
+  "action": "cancel" | "reassign",
+  "task_ids": ["id1", "id2", ...],
+  "agent": "coder"   // 仅 reassign 时需要
+}
+```
+
+响应：
+
+```json
+{
+  "succeeded": ["id1", "id3"],
+  "failed": ["id2"],
+  "errors": { "id2": "task already terminal" }
+}
+```
+
+#### 实现细节（internal/handler/bulk.go，129行）
+
+**action=cancel（绕过 FSM）：**
+
+```sql
+UPDATE tasks
+SET status = 'cancelled', updated_at = NOW()
+WHERE id IN (...)
+  AND status NOT IN ('done', 'failed', 'cancelled')
+```
+
+- 语义：运维强制取消，不经过 FSM 状态检查
+- 写入 `task_history` 记录变更（与普通状态流转一致）
+- 已 terminal 的任务（done/failed/cancelled）跳过并记入 `failed`
+
+**action=reassign：**
+
+```sql
+-- 逐条执行（支持不同 task 分配给不同 agent）
+UPDATE tasks SET assigned_to = ?, updated_at = NOW() WHERE id = ?
+```
+
+- 任意状态均可重新分配（不限于 pending）
+- 逐条处理，部分失败不影响其他条目
+
+#### 前端：DashboardPage 异常面板多选工具栏
+
+布局：
+
+```
+┌──────────────────────────────────────────────┐
+│  ☑ 全选   已选 3 个任务                        │
+│  [批量取消]  [重新分配 → coder ▼]  [清空选择]   │  ← 工具栏（选中时显示）
+├──────────────────────────────────────────────┤
+│  ☑ [failed] coder  实现登录功能        蓝色高亮 │
+│  ☑ [stuck]  qa     验证登录接口        蓝色高亮 │
+│  ☐ [done]   devops 部署生产环境                │
+└──────────────────────────────────────────────┘
+```
+
+- 选中任务时蓝色高亮
+- reassign 操作需输入目标 agent 名称
+- 操作完成后自动刷新任务列表
+
+---
+
+### 功能 B（P1）：移动端响应式布局
+
+#### AppLayout.vue 改动
+
+**导航栏（`md` 以下）：**
+
+| 尺寸 | 行为 |
+|------|------|
+| `≥ md`（768px） | 显示完整桌面导航链接 |
+| `< md` | 隐藏桌面 nav，显示汉堡菜单（☰）按钮 |
+
+移动端下拉菜单：
+- `fixed` 定位，覆盖全屏
+- 点击菜单项后自动关闭
+- 顶栏 badge 在 `sm` 以下简化为数字圆点（节省空间）
+
+**Sidebar：**
+- `lg` 以下（1024px）隐藏
+- 主内容区：`lg:ml-52` 补偿侧边栏宽度（大屏有 sidebar 时向右偏移）
+
+#### 各页面断点调整
+
+| 页面 | 改动 |
+|------|------|
+| DashboardPage | `grid-cols-1 md:grid-cols-2`（移动端单列，桌面双列）|
+| KanbanPage | `p-3 md:p-6`（移动端减少内边距；已有 `overflow-x-auto` 横向滚动）|
+
+---
+
+### 验证
+
+```
+go test -race ./... ✅
+npm run build ✅（9 chunk）
+```
+
+---
+
+## V23 Webhook 外发通知 + Timeline 增强 (commits: 205cb09, 4ba8934)
+
+### 背景
+
+V23 由两个并行提交组成：
+- **V23-A（P0）**：OutboundWebhookNotifier — 任务完成/失败时向外部系统推送 HTTP 通知（带 HMAC-SHA256 签名）
+- **V23-B（P1）**：TaskDetailPage Timeline 增强 — 每个状态变更显示持续时长；同链路任务内联展示
+
+---
+
+### 功能 A（P0）：Outbound Webhook 通知 (commit: 205cb09)
+
+#### 架构
+
+```
+任务状态变更（done/failed/cancelled）
+        │
+        ▼
+MultiNotifier（fan-out）
+   ├── DiscordNotifier（原有）
+   └── OutboundWebhookNotifier（新增）
+              │
+              ▼（goroutine, best-effort）
+        POST <WEBHOOK_URL>
+        X-Signature: sha256=<HMAC>
+        5s timeout
+```
+
+**MultiNotifier**：将多个 `Notifier` 接口实现聚合为 fan-out，对每个子 Notifier 顺序调用 `Notify()`。
+
+#### OutboundWebhookNotifier (internal/notify/outbound_webhook.go，153行)
+
+**触发条件：** `done` / `failed` / `cancelled`（其他状态跳过）
+
+**请求格式：**
+
+```http
+POST <AGENT_QUEUE_WEBHOOK_URL>
+Content-Type: application/json
+X-Signature: sha256=<hex(HMAC-SHA256(secret, body))>
+
+{
+  "event": "task.done",
+  "task": { ...完整 task 对象... },
+  "timestamp": "2026-02-27T14:43:53Z"
+}
+```
+
+**设计决策：**
+- **best-effort**：在 goroutine 中异步执行，5s 超时；失败仅 log，不影响主流程
+- **HMAC-SHA256 签名**：接收方可用 `SignatureValid(secret, body, header)` 工具函数验证签名真实性
+
+#### 配置 (internal/config/config.go)
+
+| 环境变量 | 说明 |
+|----------|------|
+| `AGENT_QUEUE_WEBHOOK_URL` | 外发目标 URL（空则不启用）|
+| `AGENT_QUEUE_WEBHOOK_SECRET` | HMAC 签名密钥（空则不签名）|
+
+启动逻辑（cmd/server/main.go）：
+```go
+if cfg.OutboundWebhookURL != "" {
+    notifier = MultiNotifier{discordNotifier, outboundWebhookNotifier}
+} else {
+    notifier = discordNotifier  // 原有行为
+}
+```
+
+#### API 版本标记
+
+`GET /api/config` 响应新增：
+```json
+{
+  "version": "v23",
+  "outbound_webhook_url": "https://..." // 已配置时返回（遮蔽敏感部分）
+}
+```
+
+#### 前端：SettingsPage.vue (路由 /settings)
+
+```
+⚙️ 系统设置
+├── 系统信息（版本 v23）
+├── Webhook 状态
+│   ├── 已启用：显示遮蔽 URL + 触发事件列表 + 请求格式说明
+│   └── 未配置：显示环境变量设置方法
+└── Agents 列表（来自 GET /api/agents/stats）
+```
+
+导航栏新增 `⚙️ 设置` 入口（AppLayout.vue）。
+
+#### 测试（5个新增）
+
+| 测试名 | 验证点 |
+|--------|--------|
+| `TestOutboundWebhookNotifier_Done` | 正常 done 事件 + HMAC 签名验证 |
+| `TestOutboundWebhookNotifier_Failed` | failed 事件触发 |
+| `TestOutboundWebhookNotifier_SkipsNonTerminal` | 非 terminal 状态不触发 |
+| `TestOutboundWebhookNotifier_BestEffortOnServerError` | 服务端 500 时不 panic |
+| `TestMultiNotifier` | fan-out 到多个 Notifier |
+
+```
+go test -race ./... ✅ 全绿
+```
+
+---
+
+### 功能 B（P1）：TaskDetailPage Timeline 增强 (commit: 4ba8934)
+
+#### Duration Badge
+
+Timeline 每个状态变更条目新增持续时长 badge：
+
+```
+┌──────────────────────────────────────────────┐
+│  ● pending → claimed        2026-02-27 14:30  │
+│                                               │
+│  ● claimed → in_progress    2026-02-27 14:31  │  2m 15s
+│                                               │
+│  ● in_progress → done       2026-02-27 14:45  │  14m 3s
+└──────────────────────────────────────────────┘
+```
+
+**实现：**
+
+```js
+// historyWithDuration computed
+// 将 history 按时间升序排列（oldest → newest）
+// 每条 entry 的 duration = 下一条 changed_at - 当前 changed_at
+// 首条无 duration（无前置时间点）
+```
+
+Badge 样式：`bg-gray-800 font-mono`（等宽字体，深色背景）
+
+格式：`Xm Ys`（如 `2m 15s`，不足 1 分钟时仅显示 `Xs`）
+
+#### Chain 内联展示
+
+若 `task.chain_id` 存在，TaskDetailPage 顶部加载并渲染同链路任务列表：
+
+```
+当前任务：[in_progress] qa 验证登录接口
+
+── 所属链路 ──────────────────────────────
+  ● [done]        coder  实现登录功能       ← 可点击跳转
+  ● [in_progress] qa     验证登录接口       ← 当前任务（蓝色高亮）
+  ↓
+  ● [pending]     devops 部署到生产         ← 可点击跳转
+──────────────────────────────────────────
+```
+
+**实现细节：**
+- 调用 `GET /api/graph/:chain_id` 获取链路任务
+- 仅当 `chainTasks.length > 1` 时展示（单任务不显示）
+- 当前任务用蓝色高亮区分
+- 加载失败 `try/catch` 静默处理（best-effort，不影响主页面）
+
+---
+
+### 验证
+
+```
+go test -race ./... ✅（含5个新 webhook 测试）
+npm run build ✅（10 chunks）
+```
+
+---
+
+## V24 i18n 中英双语 + 任务评论 (commits: a334cbf, d84c705)
+
+### 背景
+
+V24 包含两个并行功能：
+- **V24-A**：Web UI 国际化（中英双语），让非中文用户也能使用 ainative 工作台
+- **V24-B**：任务评论系统，支持 CEO 和 agents 在任务详情页留下协作记录
+
+---
+
+### 功能 A（V24-A）：i18n 中英双语 (commit: a334cbf)
+
+#### 技术选型
+
+`vue-i18n@9`，`legacy: false`（Composition API 模式）。
+
+**文件结构：**
+
+```
+web/src/i18n/
+├── zh.ts      # 中文翻译（~40 keys）
+├── en.ts      # 英文翻译（~40 keys）
+└── index.ts   # createI18n + toggleLocale + localStorage 持久化
+```
+
+**6 个命名空间：**
+
+| 命名空间 | 覆盖内容 |
+|----------|---------|
+| `nav` | 导航链接名称 |
+| `dashboard` | 搜索框、批量操作、无数据提示 |
+| `kanban` | 看板标题、loading、human badge |
+| `stats` | Agent 统计页文字 |
+| `status` | 任务状态名称 |
+| `common` | 通用文字（加载中、确认等）|
+
+#### 语言切换
+
+**导航栏（`hidden md:flex`）：** `🌐 EN / 中` 按钮，桌面端显示  
+**侧边栏底部：** `🌐 English / 中文` 切换按钮，始终可见
+
+```ts
+// i18n/index.ts
+function toggleLocale() {
+  locale.value = locale.value === 'zh' ? 'en' : 'zh'
+  localStorage.setItem('locale', locale.value)
+}
+```
+
+启动时从 `localStorage` 恢复上次选择的语言。
+
+#### navItems 动态化
+
+`AppLayout.vue` 中 `navItems` 改为 `computed`：
+
+```ts
+const navItems = computed(() => [
+  { path: '/', label: t('nav.dashboard') },
+  { path: '/kanban', label: t('nav.kanban') },
+  // ...
+])
+```
+
+语言切换后导航标签实时更新，无需刷新页面。
+
+---
+
+### 功能 B（V24-B）：任务评论系统 (commit: d84c705)
+
+#### 数据库
+
+```sql
+CREATE TABLE IF NOT EXISTS task_comments (
+  id         TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  author     TEXT NOT NULL,
+  content    TEXT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+`ON DELETE CASCADE`：任务删除时评论同步清理。
+
+#### API (internal/handler/comments.go，126行)
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/tasks/:id/comments` | 列表（按 `created_at ASC`）|
+| `POST` | `/api/tasks/:id/comments` | 新增评论（验证 task 存在）|
+
+`POST` 成功后调用 `SSEHub.Broadcast("comment_created")`，已连接的前端实时收到更新。
+
+请求体：
+
+```json
+{
+  "author": "ceo",     // 可选，默认 "human"
+  "content": "请重新检查登录边界条件"
+}
+```
+
+#### 前端：TaskDetailPage.vue 评论区
+
+```
+┌──────────────────────────────────────┐
+│  💬 评论                              │
+├──────────────────────────────────────┤
+│  [C] ceo · 14:30                     │  ← 头像首字母圆圈 + 作者/时间
+│  请重新检查登录边界条件                │  ← 内容卡片
+│                                      │
+│  [h] human · 14:35                   │
+│  已修复，请重新验证                    │
+├──────────────────────────────────────┤
+│  作者（可选）: [human        ]        │
+│  [评论内容...                      ]  │
+│  [Ctrl+Enter 发送]        [发送 →]   │
+└──────────────────────────────────────┘
+```
+
+- `onMounted` 时调用 `loadComments()` 加载历史评论
+- `Ctrl+Enter` 快捷键提交
+- 提交中禁用按钮（`commentSubmitting`）；失败显示 `commentError`
+- SSE `comment_created` 事件触发自动刷新评论列表
+
+---
+
+## V25 收版：FSM Cancel 补全 + v1.0.0 Release (commit: 61b7cde, b8330b3)
+
+### V25-A：FSM Cancel 补全 (commit: 61b7cde)
+
+#### 问题
+
+V22 `POST /api/tasks/bulk` 的 `cancel` 操作直接执行 SQL（绕过 FSM），已支持 `claimed` 和 `in_progress` 状态的任务取消。
+
+但 `PATCH /tasks/:id {status: "cancelled"}` 走 FSM 路径，`fsm.go` 和 `store.go` 的 `validateTransition` 中均未定义这两条规则，导致 PATCH 路径无法取消进行中的任务。
+
+#### 修复
+
+在两处同步新增转换规则：
+
+```go
+// internal/fsm/fsm.go
+claimed     → cancelled  ✅（新增）
+in_progress → cancelled  ✅（新增）
+
+// internal/store/store.go validateTransition
+// 同步加入两条规则
+```
+
+**影响：**
+- `PATCH /tasks/:id {status: "cancelled"}` 现在对 `claimed` 和 `in_progress` 任务有效
+- bulk cancel 与 PATCH cancel 行为完全对齐
+
+### V25-B/C：CHANGELOG + v1.0.0 Tag (commit: b8330b3)
+
+- `CHANGELOG.md` 生成（Keep a Changelog 格式，英文，84行）
+  - `[Unreleased]` 留空
+  - `[1.0.0] - 2026-02-27`：Added/Changed/Fixed，覆盖 V1–V25 全功能
+- `git tag v1.0.0 && git push origin main --tags`
+- Release URL：https://github.com/irchelper/ainative/releases/tag/v1.0.0
+
+---
+
+### ainative v1.0.0 功能全景
+
+| 版本 | 核心功能 |
+|------|---------|
+| V1–V6 | MVP：任务 CRUD、FSM、SQLite、Discord 通知 |
+| V7 | superseded_by、depends_on、blocked_downstream |
+| V8 | chain dispatch、retry_routing、notify_ceo_on_complete |
+| V9 | RetryQueue backoff、stale ticker |
+| V10–V11 | review-reject chain、per-agent webhook、cancelled 终态 |
+| V12–V13 | AI Workbench UI 骨架、autoAdvance |
+| V14–V16 | result routing、task templates、agent timeout |
+| V17–V18 | SSE 实时更新、human approval、DAG dispatch |
+| V19 | summary 过滤、动态优先级 |
+| V20 | Scalar API 文档、DAG 可视化 |
+| V21 | DashboardPage 搜索、Agent 统计面板 |
+| V22 | 批量操作、移动端响应式 |
+| V23 | Webhook 外发（HMAC）、Timeline 增强 |
+| V24 | i18n 中英双语、任务评论 |
+| V25 | FSM cancel 补全、CHANGELOG、v1.0.0 Release |
