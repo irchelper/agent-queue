@@ -50,7 +50,7 @@ function agentBadge(assignedTo: string): string {
 }
 
 function isPendingApproval(task: Task): boolean {
-  return task.assigned_to === 'human' && task.status === 'in_progress'
+  return task.assigned_to === 'human'
 }
 
 function cardClass(task: Task): string {
@@ -101,9 +101,9 @@ function cardClass(task: Task): string {
               :class="cardClass(task)"
               @click="$router.push(`/tasks/${task.id}`)"
             >
-              <!-- Pending approval badge -->
+              <!-- Human task badge -->
               <div v-if="isPendingApproval(task)" class="flex items-center gap-1 mb-1.5">
-                <span class="text-xs text-amber-400 font-semibold">👤 待审批</span>
+                <span class="text-xs text-amber-400 font-semibold">👤 人工任务</span>
               </div>
               <div class="text-xs font-medium text-gray-200 leading-snug mb-2 line-clamp-2">
                 {{ task.title }}
