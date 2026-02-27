@@ -3178,3 +3178,173 @@ func TestV14_ResultRouting_AutoAdvancePriority(t *testing.T) {
 		t.Errorf("autoAdvance task 'QA阶段' not found; tasks=%v", listResp.Tasks)
 	}
 }
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// V16: checkAgentTimeouts tests
+// ---------------------------------------------------------------------------
+
+// TestV16_AgentTimeout_NotExpired verifies tasks not yet past threshold stay in_progress.
+func TestV16_AgentTimeout_NotExpired(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+
+	h.SetAgentTimeoutMinutesForTesting(90) // high threshold
+
+	dispR := postJSON(t, srv, "/dispatch", map[string]any{
+		"title":       "v16-not-expired",
+		"assigned_to": "coder",
+	})
+	var dispResp struct{ Task model.Task }
+	json.NewDecoder(dispR.Body).Decode(&dispResp)
+	dispR.Body.Close()
+	task := dispResp.Task
+
+	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
+		map[string]any{"version": task.Version, "agent": "coder"})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed)
+	claimR.Body.Close()
+	patchTaskTo(t, srv, task.ID, "in_progress", claimed.Version)
+
+	h.CheckAgentTimeouts()
+
+	r := getJSON(t, srv, "/tasks/"+task.ID)
+	var taskResp struct{ model.Task }
+	json.NewDecoder(r.Body).Decode(&taskResp)
+	r.Body.Close()
+	if taskResp.Status != model.StatusInProgress {
+		t.Errorf("want in_progress, got %q", taskResp.Status)
+	}
+}
+
+// TestV16_AgentTimeout_Expired verifies that tasks with backdated started_at are
+// transitioned to failed and CEO is notified.
+func TestV16_AgentTimeout_Expired(t *testing.T) {
+	var ceoMessages []string
+	var mu sync.Mutex
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if msg, ok := args["message"].(string); ok {
+				mu.Lock()
+				ceoMessages = append(ceoMessages, msg)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+	h.StartRetryQueue()
+	defer h.StopRetryQueue()
+
+	h.SetAgentTimeoutMinutesForTesting(1) // 1 min threshold
+
+	dispR := postJSON(t, srv, "/dispatch", map[string]any{
+		"title":       "v16-will-timeout",
+		"assigned_to": "coder",
+	})
+	var dispResp struct{ Task model.Task }
+	json.NewDecoder(dispR.Body).Decode(&dispResp)
+	dispR.Body.Close()
+	task := dispResp.Task
+
+	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
+		map[string]any{"version": task.Version, "agent": "coder"})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed)
+	claimR.Body.Close()
+	patchTaskTo(t, srv, task.ID, "in_progress", claimed.Version)
+
+	// Backdate started_at to 2 minutes ago so it exceeds the 1-min threshold
+	backdated := time.Now().UTC().Add(-2 * time.Minute).Format("2006-01-02T15:04:05.999999Z")
+	_, err := h.DB().Exec(`UPDATE tasks SET started_at = ? WHERE id = ?`, backdated, task.ID)
+	if err != nil {
+		t.Fatalf("backdate started_at: %v", err)
+	}
+
+	h.CheckAgentTimeouts()
+	time.Sleep(200 * time.Millisecond) // allow async CEO notification
+
+	// Task should now be failed
+	r := getJSON(t, srv, "/tasks/"+task.ID)
+	var taskResp struct{ model.Task }
+	json.NewDecoder(r.Body).Decode(&taskResp)
+	r.Body.Close()
+	if taskResp.Status != model.StatusFailed {
+		t.Errorf("want failed, got %q", taskResp.Status)
+	}
+	if taskResp.FailureReason == "" {
+		t.Error("failure_reason should be set")
+	}
+	if !strings.Contains(taskResp.FailureReason, "agent_timeout") {
+		t.Errorf("failure_reason=%q, want agent_timeout prefix", taskResp.FailureReason)
+	}
+
+	// CEO should have been notified
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	snap := make([]string, len(ceoMessages))
+	copy(snap, ceoMessages)
+	mu.Unlock()
+	found := false
+	for _, msg := range snap {
+		if strings.Contains(msg, "v16-will-timeout") || strings.Contains(msg, "agent_timeout") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("CEO not notified; messages=%v", snap)
+	}
+}
+
+// TestV16_AgentTimeout_HumanSkipped verifies tasks assigned to "human" are skipped.
+func TestV16_AgentTimeout_HumanSkipped(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv, h := newTestServerWithHandler(t, oc)
+	defer srv.Close()
+
+	h.SetAgentTimeoutMinutesForTesting(1)
+
+	// Create a human in_progress task via POST /tasks directly
+	createR := postJSON(t, srv, "/tasks", map[string]any{
+		"title":       "v16-human-task",
+		"assigned_to": "human",
+	})
+	var task model.Task
+	json.NewDecoder(createR.Body).Decode(&task)
+	createR.Body.Close()
+
+	// Manually set status to in_progress via DB
+	_, err := h.DB().Exec(`UPDATE tasks SET status='in_progress', started_at=? WHERE id=?`,
+		time.Now().UTC().Add(-2*time.Minute).Format("2006-01-02T15:04:05.999999Z"), task.ID)
+	if err != nil {
+		t.Fatalf("set in_progress: %v", err)
+	}
+
+	h.CheckAgentTimeouts()
+
+	r := getJSON(t, srv, "/tasks/"+task.ID)
+	var taskResp struct{ model.Task }
+	json.NewDecoder(r.Body).Decode(&taskResp)
+	r.Body.Close()
+	// Human task should NOT be touched by agent timeout check
+	if taskResp.Status == model.StatusFailed {
+		t.Errorf("human task should not be failed by agent_timeout, got %q", taskResp.Status)
+	}
+}

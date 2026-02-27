@@ -35,6 +35,9 @@ type Handler struct {
 	staleInterval      time.Duration
 	staleThreshold     time.Duration
 	maxStaleDispatches int
+
+	// agent timeout: in_progress tasks older than this → failed
+	agentTimeoutMinutes int
 }
 
 // New creates a Handler and registers all routes on mux.
@@ -49,10 +52,11 @@ func New(db *sql.DB, s *store.Store, n notify.Notifier, oc *openclaw.Client) *Ha
 		sessionN:       sn,
 		oc:             oc,
 		db:             db,
-		staleStop:          make(chan struct{}),
-		staleInterval:      envDuration("AGENT_QUEUE_STALE_CHECK_INTERVAL", 10*time.Minute),
-		staleThreshold:     envDuration("AGENT_QUEUE_STALE_THRESHOLD", 30*time.Minute),
-		maxStaleDispatches: envInt("AGENT_QUEUE_MAX_STALE_DISPATCHES", 3),
+		staleStop:           make(chan struct{}),
+		staleInterval:       envDuration("AGENT_QUEUE_STALE_CHECK_INTERVAL", 10*time.Minute),
+		staleThreshold:      envDuration("AGENT_QUEUE_STALE_THRESHOLD", 30*time.Minute),
+		maxStaleDispatches:  envInt("AGENT_QUEUE_MAX_STALE_DISPATCHES", 3),
+		agentTimeoutMinutes: envInt("AGENT_QUEUE_AGENT_TIMEOUT_MINUTES", 90),
 	}
 }
 
@@ -61,6 +65,12 @@ func (h *Handler) SetStaleThresholdForTesting(d time.Duration) { h.staleThreshol
 
 // SetMaxStaleDispatchesForTesting overrides the max stale dispatches. Test use only.
 func (h *Handler) SetMaxStaleDispatchesForTesting(n int) { h.maxStaleDispatches = n }
+
+// SetAgentTimeoutMinutesForTesting overrides the agent timeout threshold. Test use only.
+func (h *Handler) SetAgentTimeoutMinutesForTesting(m int) { h.agentTimeoutMinutes = m }
+
+// DB returns the underlying *sql.DB. Test use only (for backdating timestamps etc.).
+func (h *Handler) DB() *sql.DB { return h.db }
 
 // StartRetryQueue starts the SessionNotifier's internal retry queue goroutine.
 func (h *Handler) StartRetryQueue() {
@@ -107,6 +117,7 @@ func (h *Handler) runStaleTicker() {
 		case <-ticker.C:
 			h.checkStaleTasks()
 			h.checkHumanTimeouts()
+			h.checkAgentTimeouts()
 		}
 	}
 }
@@ -210,6 +221,58 @@ func (h *Handler) checkHumanTimeouts() {
 		}
 	}
 }
+
+// checkAgentTimeouts scans in_progress tasks (assigned_to != "human") and
+// transitions to failed if started_at exceeds agentTimeoutMinutes.
+// Triggered on every ticker cycle alongside checkStaleTasks and checkHumanTimeouts.
+func (h *Handler) checkAgentTimeouts() {
+	if h.agentTimeoutMinutes <= 0 {
+		return
+	}
+	tasks, err := h.store.ListTasks("in_progress", "", "", nil)
+	if err != nil {
+		log.Printf("[agent_timeout] ListTasks: %v", err)
+		return
+	}
+	now := time.Now().UTC()
+	threshold := time.Duration(h.agentTimeoutMinutes) * time.Minute
+	for _, task := range tasks {
+		if task.AssignedTo == "human" {
+			continue
+		}
+		if task.StartedAt == nil {
+			continue
+		}
+		if now.Sub(*task.StartedAt) <= threshold {
+			continue
+		}
+		// Timed out → PATCH failed
+		failedStatus := model.StatusFailed
+		reason := fmt.Sprintf("agent_timeout: exceeded %dmin SLA", h.agentTimeoutMinutes)
+		_, _, err := h.store.PatchTask(task.ID, model.PatchTaskRequest{
+			Status:        &failedStatus,
+			FailureReason: &reason,
+			Version:       task.Version,
+			ChangedBy:     "system",
+		})
+		if err != nil {
+			log.Printf("[agent_timeout] PatchTask failed for %s: %v", task.ID, err)
+			continue
+		}
+		log.Printf("[agent_timeout] task %s (%s) timed out after %dmin → failed",
+			task.ID, task.Title, h.agentTimeoutMinutes)
+		// Notify CEO via SessionNotifier (same path as handleFailedTask)
+		if h.sessionN != nil {
+			task.FailureReason = reason
+			if err := h.sessionN.OnFailed(task); err != nil {
+				log.Printf("[agent_timeout] OnFailed notification for %s: %v", task.ID, err)
+			}
+		}
+	}
+}
+
+// CheckAgentTimeouts is exported for testing.
+func (h *Handler) CheckAgentTimeouts() { h.checkAgentTimeouts() }
 
 // advanceHumanTask drives a pending human task through FSM states to reach targetStatus.
 // For done/blocked, the FSM path is: pending → claimed → in_progress → target.
