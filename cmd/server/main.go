@@ -46,6 +46,15 @@ func main() {
 	// Build notifier: Discord webhook if configured.
 	// SessionNotifier (CEO alerts on unhandled failures) is wired inside handler.New.
 	n := notify.NewFromEnv()
+
+	// V23-A: outbound webhook notifier (best-effort, wraps the Discord notifier).
+	if webhookURL := envOr("AGENT_QUEUE_WEBHOOK_URL", ""); webhookURL != "" {
+		secret := envOr("AGENT_QUEUE_WEBHOOK_SECRET", "")
+		outbound := notify.NewOutboundWebhookNotifier(webhookURL, secret)
+		n = notify.NewMultiNotifier(n, outbound)
+		log.Printf("outbound webhook enabled: %s", webhookURL)
+	}
+
 	h := handler.New(database, s, n, oc)
 
 	// Start background services.

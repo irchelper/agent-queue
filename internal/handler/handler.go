@@ -1446,8 +1446,9 @@ func (h *Handler) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		Label string `json:"label"`
 	}
 	type Response struct {
-		Agents  []AgentInfo `json:"agents"`
-		Version string      `json:"version"`
+		Agents             []AgentInfo `json:"agents"`
+		Version            string      `json:"version"`
+		OutboundWebhookURL string      `json:"outbound_webhook_url,omitempty"`
 	}
 
 	// Default known agents (can be extended via config in future phases).
@@ -1464,7 +1465,14 @@ func (h *Handler) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		{"ops", "研究员"},
 	}
 
-	writeJSON(w, http.StatusOK, Response{Agents: agents, Version: "v12"})
+	// V23-A: expose (non-secret) webhook config.
+	outboundWebhookURL := os.Getenv("AGENT_QUEUE_WEBHOOK_URL")
+
+	writeJSON(w, http.StatusOK, Response{
+		Agents:             agents,
+		Version:            "v23",
+		OutboundWebhookURL: outboundWebhookURL,
+	})
 }
 
 // handleAPIGraph serves GET /api/graph/:chain_id.

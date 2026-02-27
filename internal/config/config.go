@@ -37,10 +37,14 @@ type TimeoutConfig struct {
 
 // NotificationConfig holds notification channel settings.
 type NotificationConfig struct {
-	WebhookURL    string            `yaml:"webhook_url"`
-	AgentWebhooks map[string]string `yaml:"agent_webhooks"`
-	OpenClawURL   string            `yaml:"openclaw_url"`
-	OpenClawKey   string            `yaml:"openclaw_key"`
+	WebhookURL       string            `yaml:"webhook_url"`
+	AgentWebhooks    map[string]string `yaml:"agent_webhooks"`
+	OpenClawURL      string            `yaml:"openclaw_url"`
+	OpenClawKey      string            `yaml:"openclaw_key"`
+	// OutboundWebhookURL is the external webhook endpoint for task events (V23-A).
+	OutboundWebhookURL    string `yaml:"outbound_webhook_url"`
+	// OutboundWebhookSecret is the HMAC-SHA256 signing key for outbound webhooks.
+	OutboundWebhookSecret string `yaml:"outbound_webhook_secret"`
 }
 
 // WebConfig holds frontend serving settings.
@@ -154,6 +158,12 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("AGENT_QUEUE_AGENT_WEBHOOKS"); v != "" {
 		cfg.Notifications.AgentWebhooks = parseAgentWebhooksEnv(v)
+	}
+	if v := os.Getenv("AGENT_QUEUE_WEBHOOK_URL"); v != "" {
+		cfg.Notifications.OutboundWebhookURL = v
+	}
+	if v := os.Getenv("AGENT_QUEUE_WEBHOOK_SECRET"); v != "" {
+		cfg.Notifications.OutboundWebhookSecret = v
 	}
 }
 
