@@ -30,6 +30,11 @@ const router = createRouter({
       name: 'graph',
       component: () => import('@/pages/GraphVisualizationPage.vue'),
     },
+    {
+      path: '/stats',
+      name: 'stats',
+      component: () => import('@/pages/AgentStatsPage.vue'),
+    },
   ],
 })
 

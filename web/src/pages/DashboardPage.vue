@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import AppLayout from '@/layouts/AppLayout.vue'
 import { useDashboardStore } from '@/stores/dashboardStore'
 import { usePolling } from '@/composables/usePolling'
@@ -12,6 +12,44 @@ const { loading, error, refresh } = usePolling(() => store.fetch(), 10_000)
 
 // V17: SSE real-time updates — refresh dashboard on any task event.
 useSSE(() => store.fetch(), { fallbackInterval: 10_000 })
+
+// V21: Search
+const searchQuery = ref('')
+const searchResults = ref<Task[] | null>(null)
+const searching = ref(false)
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+async function doSearch(q: string) {
+  if (!q.trim()) {
+    searchResults.value = null
+    return
+  }
+  searching.value = true
+  try {
+    const resp = await api.listTasks({ limit: 100 })
+    // Client-side filter using already-fetched data from /tasks endpoint
+    const all = resp.tasks ?? []
+    const lower = q.toLowerCase()
+    searchResults.value = all.filter(
+      (t) =>
+        t.title.toLowerCase().includes(lower) ||
+        (t.description ?? '').toLowerCase().includes(lower),
+    )
+  } catch {
+    searchResults.value = null
+  } finally {
+    searching.value = false
+  }
+}
+
+watch(searchQuery, (q) => {
+  if (searchTimer) clearTimeout(searchTimer)
+  if (!q.trim()) {
+    searchResults.value = null
+    return
+  }
+  searchTimer = setTimeout(() => doSearch(q), 300)
+})
 
 // Human todo tasks (assigned_to === 'human')
 const humanTodos = computed(() =>
@@ -109,6 +147,56 @@ function statusBadgeClass(status: string): string {
     >
       <span>{{ error }}</span>
       <button class="text-xs underline ml-4" @click="refresh">重试</button>
+    </div>
+
+    <!-- V21: Search bar -->
+    <div class="mx-6 mt-4 mb-0 relative">
+      <div class="flex items-center gap-2 bg-gray-900 border border-gray-700 focus-within:border-blue-500/50 rounded-xl px-3 py-2 transition-colors">
+        <span class="text-gray-500 text-sm">🔍</span>
+        <input
+          v-model="searchQuery"
+          type="text"
+          placeholder="搜索任务标题或描述…"
+          class="flex-1 bg-transparent text-sm text-gray-200 placeholder-gray-600 focus:outline-none"
+        />
+        <button
+          v-if="searchQuery"
+          class="text-gray-500 hover:text-gray-300 text-xs"
+          @click="searchQuery = ''"
+        >✕</button>
+        <span v-if="searching" class="text-gray-600 text-xs">…</span>
+      </div>
+
+      <!-- Search results overlay -->
+      <div
+        v-if="searchResults !== null"
+        class="absolute left-0 right-0 top-full mt-1 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl z-50 max-h-80 overflow-y-auto"
+      >
+        <div v-if="!searchResults.length" class="px-4 py-6 text-center text-gray-600 text-sm">无匹配结果</div>
+        <div
+          v-for="task in searchResults"
+          :key="task.id"
+          class="flex items-start gap-3 px-4 py-3 hover:bg-gray-800 cursor-pointer border-b border-gray-800 last:border-0 transition-colors"
+          @click="$router.push(`/tasks/${task.id}`); searchQuery = ''"
+        >
+          <span
+            class="text-xs px-1.5 py-0.5 rounded border mt-0.5 shrink-0"
+            :class="{
+              'text-green-400 border-green-500/30 bg-green-500/10': task.status === 'done',
+              'text-red-400 border-red-500/30 bg-red-500/10': task.status === 'failed',
+              'text-blue-400 border-blue-500/30 bg-blue-500/10': task.status === 'in_progress',
+              'text-gray-400 border-gray-600 bg-gray-700/40': !['done','failed','in_progress'].includes(task.status),
+            }"
+          >{{ task.status }}</span>
+          <div class="flex-1 min-w-0">
+            <div class="text-sm text-gray-200 truncate">{{ task.title }}</div>
+            <div class="text-xs text-gray-500 mt-0.5">{{ task.assigned_to }}</div>
+          </div>
+        </div>
+        <div class="px-4 py-2 text-xs text-gray-600 border-t border-gray-800">
+          共 {{ searchResults.length }} 个结果
+        </div>
+      </div>
     </div>
 
     <div class="grid grid-cols-2 gap-0 h-full">

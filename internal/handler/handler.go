@@ -359,6 +359,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/docs", h.handleDocs)
 	mux.HandleFunc("/openapi.json", h.handleOpenAPISpec)
 	mux.HandleFunc("/api/graph/", h.handleAPIGraph)
+	// V21: Agent stats.
+	mux.HandleFunc("/api/agents/stats", h.handleAPIAgentStats)
 }
 
 // -------------------------------------------------------------------
@@ -1499,4 +1501,68 @@ func (h *Handler) handleAPIGraph(w http.ResponseWriter, r *http.Request) {
 		Tasks   []model.Task `json:"tasks"`
 	}
 	writeJSON(w, http.StatusOK, GraphData{ChainID: chainID, Tasks: enriched})
+}
+
+// handleAPIAgentStats serves GET /api/agents/stats.
+// Returns per-agent aggregated task statistics.
+func (h *Handler) handleAPIAgentStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	type AgentStat struct {
+		Agent               string  `json:"agent"`
+		TotalTasks          int     `json:"total_tasks"`
+		DoneCount           int     `json:"done_count"`
+		FailedCount         int     `json:"failed_count"`
+		AvgDurationMinutes  float64 `json:"avg_duration_minutes"`
+		SuccessRate         float64 `json:"success_rate"` // done/(done+failed)*100
+	}
+
+	rows, err := h.db.QueryContext(r.Context(), `
+		SELECT
+			assigned_to,
+			COUNT(*) AS total,
+			SUM(CASE WHEN status = 'done'   THEN 1 ELSE 0 END) AS done,
+			SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+			AVG(CASE
+				WHEN status IN ('done','failed') AND started_at IS NOT NULL
+				THEN (julianday(updated_at) - julianday(started_at)) * 24 * 60
+				ELSE NULL
+			END) AS avg_min
+		FROM tasks
+		WHERE assigned_to != ''
+		GROUP BY assigned_to
+		ORDER BY total DESC
+	`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	stats := []AgentStat{}
+	for rows.Next() {
+		var s AgentStat
+		var avgMin *float64
+		if err := rows.Scan(&s.Agent, &s.TotalTasks, &s.DoneCount, &s.FailedCount, &avgMin); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if avgMin != nil {
+			s.AvgDurationMinutes = *avgMin
+		}
+		closed := s.DoneCount + s.FailedCount
+		if closed > 0 {
+			s.SuccessRate = float64(s.DoneCount) / float64(closed) * 100
+		}
+		stats = append(stats, s)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"stats": stats, "count": len(stats)})
 }
