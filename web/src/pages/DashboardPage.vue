@@ -58,9 +58,9 @@ watch(searchQuery, (q) => {
   searchTimer = setTimeout(() => doSearch(q), 300)
 })
 
-// Human todo tasks (assigned_to === 'human')
+// Todo tasks requiring human review (align with badge semantics)
 const humanTodos = computed(() =>
-  (store.data?.todo ?? []).filter((t) => t.assigned_to === 'human'),
+  (store.data?.todo ?? []).filter((t) => t.requires_review === true),
 )
 const exceptions = computed(() => store.data?.exceptions ?? [])
 const todoCount = computed(() => humanTodos.value.length)
