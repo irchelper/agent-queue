@@ -73,6 +73,7 @@ type CreateTaskRequest struct {
 	Priority              int      `json:"priority"`
 	TimeoutMinutes        *int     `json:"timeout_minutes"`
 	TimeoutAction         *string  `json:"timeout_action"`
+	CommitURL             *string  `json:"commit_url"`
 	DependsOn             []string `json:"depends_on"`
 }
 

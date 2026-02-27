@@ -37,13 +37,13 @@ func (s *Store) CreateTask(req model.CreateTaskRequest) (model.Task, error) {
 		INSERT INTO tasks (id, title, description, status, assigned_to, retry_assigned_to,
 		                   chain_id, notify_ceo_on_complete,
 		                   parent_id, mode, requires_review, priority, version,
-		                   timeout_minutes, timeout_action,
+		                   timeout_minutes, timeout_action, commit_url,
 		                   created_at, updated_at)
-		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
 		id, req.Title, req.Description, req.AssignedTo, req.RetryAssignedTo,
 		req.ChainID, boolToInt(req.NotifyCEOOnComplete),
 		req.ParentID, req.Mode, boolToInt(req.RequiresReview), req.Priority,
-		req.TimeoutMinutes, req.TimeoutAction,
+		req.TimeoutMinutes, req.TimeoutAction, req.CommitURL,
 		now, now)
 	if err != nil {
 		return model.Task{}, fmt.Errorf("insert task: %w", err)
