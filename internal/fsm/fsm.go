@@ -17,13 +17,15 @@ var validTransitions = map[model.Status]map[model.Status]bool{
 	model.StatusClaimed: {
 		model.StatusInProgress: true,
 		model.StatusPending:    true, // release
+		model.StatusCancelled:  true, // V25-A: admin cancel
 	},
 	model.StatusInProgress: {
-		model.StatusReview:  true,
-		model.StatusDone:    true,
-		model.StatusBlocked: true,
-		model.StatusFailed:  true, // execution error – terminal
-		model.StatusPending: true, // timeout/release
+		model.StatusReview:     true,
+		model.StatusDone:       true,
+		model.StatusBlocked:    true,
+		model.StatusFailed:     true,      // execution error – terminal
+		model.StatusPending:    true,      // timeout/release
+		model.StatusCancelled:  true,      // V25-A: admin cancel
 	},
 	model.StatusReview: {
 		model.StatusDone:       true,

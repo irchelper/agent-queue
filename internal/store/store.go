@@ -1045,11 +1045,13 @@ func validateTransition(from, to model.Status, requiresReview bool) error {
 		{model.StatusPending, model.StatusCancelled}:    true,
 		{model.StatusClaimed, model.StatusInProgress}:   true,
 		{model.StatusClaimed, model.StatusPending}:      true,
+		{model.StatusClaimed, model.StatusCancelled}:    true, // V25-A: admin cancel
 		{model.StatusInProgress, model.StatusReview}:    true,
 		{model.StatusInProgress, model.StatusDone}:      true,
 		{model.StatusInProgress, model.StatusBlocked}:   true,
 		{model.StatusInProgress, model.StatusFailed}:    true,
 		{model.StatusInProgress, model.StatusPending}:   true,
+		{model.StatusInProgress, model.StatusCancelled}: true, // V25-A: admin cancel
 		{model.StatusReview, model.StatusDone}:          true,
 		{model.StatusReview, model.StatusInProgress}:    true,
 		{model.StatusBlocked, model.StatusPending}:      true,
