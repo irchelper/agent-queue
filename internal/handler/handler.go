@@ -327,11 +327,16 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 
 	// Create task.
 	task, err := h.store.CreateTask(model.CreateTaskRequest{
-		Title:          req.Title,
-		Description:    req.Description,
-		AssignedTo:     req.AssignedTo,
-		RequiresReview: req.RequiresReview,
-		DependsOn:      req.DependsOn,
+		Title:               req.Title,
+		Description:         req.Description,
+		AssignedTo:          req.AssignedTo,
+		RequiresReview:      req.RequiresReview,
+		DependsOn:           req.DependsOn,
+		NotifyCEOOnComplete: req.NotifyCEOOnComplete,
+		Priority:            req.Priority,
+		CommitURL:           req.CommitURL,
+		TimeoutMinutes:      req.TimeoutMinutes,
+		TimeoutAction:       req.TimeoutAction,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

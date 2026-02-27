@@ -128,12 +128,17 @@ type ErrorResponse struct {
 
 // DispatchRequest is the body for POST /dispatch.
 type DispatchRequest struct {
-	Title          string   `json:"title"`
-	AssignedTo     string   `json:"assigned_to"`
-	Description    string   `json:"description"`
-	RequiresReview bool     `json:"requires_review"`
-	DependsOn      []string `json:"depends_on"`
-	Result         string   `json:"result"`
+	Title               string   `json:"title"`
+	AssignedTo          string   `json:"assigned_to"`
+	Description         string   `json:"description"`
+	RequiresReview      bool     `json:"requires_review"`
+	DependsOn           []string `json:"depends_on"`
+	Result              string   `json:"result"`
+	NotifyCEOOnComplete bool     `json:"notify_ceo_on_complete"`
+	Priority            int      `json:"priority"`
+	CommitURL           *string  `json:"commit_url"`
+	TimeoutMinutes      *int     `json:"timeout_minutes"`
+	TimeoutAction       *string  `json:"timeout_action"`
 }
 
 // DispatchResponse wraps the created task and a flag indicating whether the

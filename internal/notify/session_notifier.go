@@ -1,9 +1,15 @@
-// Package notify – SessionNotifier sends CEO alerts via OpenClaw sessions_send.
+// Package notify – SessionNotifier sends CEO alerts via Discord webhook and
+// OpenClaw sessions_send.
 package notify
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"time"
 
 	"github.com/irchelper/agent-queue/internal/model"
 	"github.com/irchelper/agent-queue/internal/openclaw"
@@ -12,16 +18,27 @@ import (
 // CEOSessionKey is the default CEO session for alerts.
 const CEOSessionKey = "agent:ceo:discord:channel:1475338424293789877"
 
-// SessionNotifier notifies the CEO session when a task fails without a
-// retry_assigned_to directive (i.e., human intervention is needed).
+// SessionNotifier notifies the CEO via:
+//  1. Discord webhook (primary – always visible in #首席ceo channel)
+//  2. OpenClaw sessions_send (secondary – injects into CEO session context)
+//
+// The webhook path is reliable regardless of whether CEO session is active.
+// sessions_send is kept as a best-effort supplement.
 type SessionNotifier struct {
-	client        *openclaw.Client
-	ceoSessionKey string
-	retryQ        *RetryQueue // CEO-critical notifications walk this queue
+	client         *openclaw.Client
+	ceoSessionKey  string
+	ceoWebhookURL  string       // POST CEO alerts directly to Discord channel
+	ceoUserID      string       // Discord user ID for @mention
+	retryQ         *RetryQueue  // CEO-critical notifications walk this queue
+	httpClient     *http.Client
 }
 
 // NewSessionNotifier creates a SessionNotifier targeting the given CEO session.
 // If ceoSessionKey is empty, CEOSessionKey is used.
+// CEO webhook URL and user ID are read from env:
+//   - AGENT_QUEUE_CEO_WEBHOOK_URL  (direct Discord webhook for #首席ceo)
+//   - AGENT_QUEUE_DISCORD_USER_ID  (for @mention in webhook messages)
+//
 // Call Start() / Stop() on the embedded RetryQueue via the returned notifier.
 func NewSessionNotifier(client *openclaw.Client, ceoSessionKey string) *SessionNotifier {
 	if ceoSessionKey == "" {
@@ -30,7 +47,10 @@ func NewSessionNotifier(client *openclaw.Client, ceoSessionKey string) *SessionN
 	return &SessionNotifier{
 		client:        client,
 		ceoSessionKey: ceoSessionKey,
+		ceoWebhookURL: os.Getenv("AGENT_QUEUE_CEO_WEBHOOK_URL"),
+		ceoUserID:     os.Getenv("AGENT_QUEUE_DISCORD_USER_ID"),
 		retryQ:        NewRetryQueue(),
+		httpClient:    &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -43,6 +63,58 @@ func (s *SessionNotifier) Stop() { s.retryQ.Stop() }
 // RetryQueueLen returns the number of pending retries (for testing/monitoring).
 func (s *SessionNotifier) RetryQueueLen() int { return s.retryQ.Len() }
 
+// sendWebhook posts a message directly to the CEO Discord channel via webhook.
+// Returns nil if no webhook URL is configured (silent skip).
+func (s *SessionNotifier) sendWebhook(content string) error {
+	if s.ceoWebhookURL == "" {
+		return nil
+	}
+	body, err := json.Marshal(map[string]string{"content": content})
+	if err != nil {
+		return fmt.Errorf("marshal webhook body: %w", err)
+	}
+	resp, err := s.httpClient.Post(s.ceoWebhookURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("webhook post: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// mention returns a Discord @mention prefix if ceoUserID is set, else "".
+func (s *SessionNotifier) mention() string {
+	if s.ceoUserID != "" {
+		return fmt.Sprintf("<@%s> ", s.ceoUserID)
+	}
+	return ""
+}
+
+// notifyCEO sends via webhook (primary) + sessions_send (secondary).
+// Either path may fail independently; both failures are logged.
+func (s *SessionNotifier) notifyCEO(label, webhookContent, sessionMsg string) {
+	// Primary: Discord webhook – always visible in channel
+	if err := s.sendWebhook(webhookContent); err != nil {
+		log.Printf("[session_notifier] %s webhook failed: %v", label, err)
+	} else if s.ceoWebhookURL != "" {
+		log.Printf("[session_notifier] %s webhook: CEO notified via Discord", label)
+	}
+
+	// Secondary: sessions_send via RetryQueue (best-effort context injection)
+	sessionKey := s.ceoSessionKey
+	sendFn := func() error {
+		if err := s.client.SendToSession(sessionKey, sessionMsg); err != nil {
+			log.Printf("[session_notifier] %s sessions_send → %s failed: %v", label, sessionKey, err)
+			return err
+		}
+		log.Printf("[session_notifier] %s sessions_send → %s: ok", label, sessionKey)
+		return nil
+	}
+	s.retryQ.Enqueue(label, sendFn)
+}
+
 // OnFailed sends a CEO alert for a failed task that has no retry directive.
 // Message format matches docs/ARCH.md §5 spec.
 // Uses RetryQueue: up to 3 retries with 30s/60s/120s backoff.
@@ -54,20 +126,16 @@ func (s *SessionNotifier) OnFailed(task model.Task) error {
 	if reason == "" {
 		reason = "（无）"
 	}
-	msg := fmt.Sprintf(
+	sessionMsg := fmt.Sprintf(
 		"[agent-queue] ❌ 任务失败需介入：%s\nresult: %s\ntask_id: %s",
 		task.Title, reason, task.ID,
 	)
+	webhookContent := fmt.Sprintf(
+		"%s❌ **任务失败需介入**\n**任务：** %s\n**失败原因：** %s\n`task_id: %s`",
+		s.mention(), task.Title, reason, task.ID,
+	)
 	label := "OnFailed:" + task.ID
-	sendFn := func() error {
-		if err := s.client.SendToSession(s.ceoSessionKey, msg); err != nil {
-			log.Printf("[session_notifier] OnFailed → %s failed: %v", s.ceoSessionKey, err)
-			return err
-		}
-		log.Printf("[session_notifier] OnFailed → %s: notified CEO", s.ceoSessionKey)
-		return nil
-	}
-	s.retryQ.Enqueue(label, sendFn)
+	s.notifyCEO(label, webhookContent, sessionMsg)
 	return nil
 }
 
@@ -122,17 +190,22 @@ func (s *SessionNotifier) OnChainComplete(chainID, chainTitle string, tasks []mo
 	}
 	lines += fmt.Sprintf("\nchain_id: %s", chainID)
 
-	label := "OnChainComplete:" + chainID
-	msg := lines
-	sendFn := func() error {
-		if err := s.client.SendToSession(s.ceoSessionKey, msg); err != nil {
-			log.Printf("[session_notifier] OnChainComplete → %s failed: %v", s.ceoSessionKey, err)
-			return err
+	// Webhook content (richer Discord formatting)
+	taskLines := ""
+	for _, t := range tasks {
+		result := t.Result
+		if result == "" {
+			result = "（无）"
 		}
-		log.Printf("[session_notifier] OnChainComplete chain=%s: notified CEO", chainID)
-		return nil
+		taskLines += fmt.Sprintf("\n  • %s (%s) — %s", t.Title, t.AssignedTo, result)
 	}
-	s.retryQ.Enqueue(label, sendFn)
+	webhookContent := fmt.Sprintf(
+		"%s✅ **任务链完成：%s**\n完成：%d/%d%s\n`chain_id: %s`",
+		s.mention(), chainTitle, done, total, taskLines, chainID,
+	)
+
+	label := "OnChainComplete:" + chainID
+	s.notifyCEO(label, webhookContent, lines)
 	return nil
 }
 
@@ -144,18 +217,14 @@ func (s *SessionNotifier) OnTaskComplete(task model.Task) error {
 	if result == "" {
 		result = "（无）"
 	}
-	msg := fmt.Sprintf("[agent-queue] ✅ 任务完成：%s\n执行人：%s\n结果：%s\ntask_id: %s",
+	sessionMsg := fmt.Sprintf("[agent-queue] ✅ 任务完成：%s\n执行人：%s\n结果：%s\ntask_id: %s",
 		task.Title, task.AssignedTo, result, task.ID)
+	webhookContent := fmt.Sprintf(
+		"%s✅ **任务完成：%s**\n**执行人：** %s\n**结果：** %s\n`task_id: %s`",
+		s.mention(), task.Title, task.AssignedTo, result, task.ID,
+	)
 
 	label := "OnTaskComplete:" + task.ID
-	sendFn := func() error {
-		if err := s.client.SendToSession(s.ceoSessionKey, msg); err != nil {
-			log.Printf("[session_notifier] OnTaskComplete → %s failed: %v", s.ceoSessionKey, err)
-			return err
-		}
-		log.Printf("[session_notifier] OnTaskComplete task=%s: notified CEO", task.ID)
-		return nil
-	}
-	s.retryQ.Enqueue(label, sendFn)
+	s.notifyCEO(label, webhookContent, sessionMsg)
 	return nil
 }
