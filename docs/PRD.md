@@ -3,7 +3,7 @@
 > Status: Draft → v11
 > Owner: 产品经理
 > Date: 2026-02-25
-> Updated: 2026-02-27 (v11 — 新增 F17 SessionNotifier 内存重试队列（CEO通知3次/30s-60s-120s backoff）、F18 stale任务自动re-dispatch（10min ticker/30min阈值）；代码基线：commit `34b43a0` — retry_routing UNIQUE INDEX 幂等性修复)
+> Updated: 2026-02-27 (v11 — 新增 F17 SessionNotifier 内存重试队列（CEO通知3次/30s-60s-120s backoff）、F18 stale任务自动re-dispatch（10min ticker/30min阈值）；代码基线：commit `e2f142a` — OnTaskComplete 单任务 notify_ceo_on_complete 支持)
 
 ---
 

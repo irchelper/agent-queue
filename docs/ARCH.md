@@ -1,6 +1,6 @@
 # agent-queue 架构说明
 
-> 版本：v11 | 更新：2026-02-27 | 代码基线：commit `34b43a0` — retry_routing UNIQUE INDEX 幂等性修复（seed INSERT OR IGNORE + migration 去重）
+> 版本：v11 | 更新：2026-02-27 | 代码基线：commit `e2f142a` — OnTaskComplete 单任务 notify_ceo_on_complete 支持
 > 对应 PRD：`PRD.md`
 
 ---
@@ -330,9 +330,11 @@ task_id: {id}
 chain_id: {chain_id}
 ```
 
-**触发条件：** 链内任意任务 PATCH done 时，若 `chain_id != "" && notify_ceo_on_complete=true`，server 调 `IsChainComplete(chain_id)`，确认全链完成后触发 `OnChainComplete`。
+**触发条件（两个分支）：**
+- **链路完成：** 链内任意任务 PATCH done 时，若 `chain_id != "" && notify_ceo_on_complete=true`，server 调 `IsChainComplete(chain_id)`，确认全链完成后触发 `OnChainComplete`（含完整子任务结果）
+- **单任务完成（commit e2f142a，2026-02-27）：** 任务 PATCH done 时，若 `chain_id == "" && notify_ceo_on_complete=true`，触发 `OnTaskComplete(task)`；消息格式与 OnChainComplete 相同，走 RetryQueue（30s/60s/120s backoff）
 
-**设计：** 与 dispatch 极简格式不同，链路完成消息含完整子任务结果——因为 CEO 此时是"结果汇总者"角色，需要知道每步的 result 才能决定下一阶段。
+**设计：** 与 dispatch 极简格式不同，完成通知含任务 result——CEO 此时是"结果接收者"角色，需要知道 result 才能决定下一阶段。
 
 ### SessionNotifier 发送目标原则
 
@@ -342,6 +344,7 @@ chain_id: {chain_id}
 - done 触发下游解锁 → 下游专家 session（自动唤醒，V8 triggered 缺口修复）
 - failed 需 CEO 介入 → CEO session
 - chain 全部完成（notify_ceo_on_complete=true） → CEO session（V8 新增）
+- 单任务完成（chain_id="" && notify_ceo_on_complete=true） → CEO session（e2f142a 新增）
 
 ---
 
@@ -355,6 +358,7 @@ chain_id: {chain_id}
 | 任务 failed（有 retry_assigned_to，含 retry_routing 表命中） | 不感知（自动退单，Go server 处理）|
 | 任务 failed（无 retry_assigned_to 且 retry_routing 无匹配） | SessionNotifier 唤醒 CEO session |
 | 链路全部完成（notify_ceo_on_complete=true）[V8] | SessionNotifier.OnChainComplete 唤醒 CEO session，含完整子任务结果 |
+| 单任务完成（chain_id="" && notify_ceo_on_complete=true）[e2f142a] | SessionNotifier.OnTaskComplete 唤醒 CEO session，含任务 result |
 | 用户可见通知 | Discord webhook（done / failed 均有，用于审计）|
 | session 启动时 | CEO 主动调 `GET /tasks/summary` 掌握全局 |
 
@@ -687,6 +691,7 @@ type RetryQueue struct {
 |---------|------|------|
 | failed → CEO | ✅ | CEO 必须感知，延迟=阻塞 |
 | chain_complete → CEO | ✅ | CEO 需要感知链路完成 |
+| single_task_complete → CEO | ✅ | CEO 需要感知单任务完成（e2f142a 新增）|
 | dispatch → 专家 | ❌ | 任务在 SQLite，专家 startup poll 兜底；功能 C 再兜底 |
 | triggered → 下游专家 | ❌ | 同上 |
 
