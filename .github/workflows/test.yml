@@ -1,0 +1,50 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-go:
+    name: Go Tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Run Go tests with race detector
+        run: go test -race ./...
+      - name: Go coverage report
+        run: |
+          go test ./... -coverprofile=cover.out
+          go tool cover -func=cover.out
+
+  test-web:
+    name: Web Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check if web directory exists
+        id: web-check
+        run: |
+          if [ -d "web" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.web-check.outputs.exists == 'true'
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: Run web tests with coverage
+        if: steps.web-check.outputs.exists == 'true'
+        run: cd web && npm ci && npm test -- --coverage
+      - name: Skip (web/ not yet present)
+        if: steps.web-check.outputs.exists == 'false'
+        run: echo "web/ directory not found, skipping frontend tests"

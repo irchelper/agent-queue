@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if web directory exists
+        id: web-check
+        run: |
+          if [ -d "web" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.web-check.outputs.exists == 'true'
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        if: steps.web-check.outputs.exists == 'true'
+        run: cd web && npm ci && npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build Go binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -o ainative-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ainative-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ainative-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --generate-notes \
+            --title "Release ${{ github.ref_name }}" \
+            dist/ainative-linux-amd64/ainative-linux-amd64 \
+            dist/ainative-linux-arm64/ainative-linux-arm64 \
+            dist/ainative-darwin-amd64/ainative-darwin-amd64 \
+            dist/ainative-darwin-arm64/ainative-darwin-arm64
