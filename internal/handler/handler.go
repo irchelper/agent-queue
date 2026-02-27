@@ -538,6 +538,15 @@ func (h *Handler) patchTask(w http.ResponseWriter, r *http.Request, id string) {
 			}(triggered)
 		}
 
+		// 单任务完成通知：无 chain_id 且 notify_ceo_on_complete=true 时直接通知 CEO。
+		if task.ChainID == "" && task.NotifyCEOOnComplete && h.sessionN != nil {
+			go func(t model.Task) {
+				if err := h.sessionN.OnTaskComplete(t); err != nil {
+					log.Printf("[handler] OnTaskComplete task=%s: %v", t.ID, err)
+				}
+			}(task)
+		}
+
 		// V8 chain complete：若整条链已完成且需要通知 CEO，发送汇总消息。
 		if task.ChainID != "" && task.NotifyCEOOnComplete && h.sessionN != nil {
 			go func(chainID string) {

@@ -135,3 +135,27 @@ func (s *SessionNotifier) OnChainComplete(chainID, chainTitle string, tasks []mo
 	s.retryQ.Enqueue(label, sendFn)
 	return nil
 }
+
+// OnTaskComplete sends a CEO notification when a single task (no chain) completes.
+// Triggered when task.NotifyCEOOnComplete == true && task.ChainID == "".
+// Uses RetryQueue: up to 3 retries with 30s/60s/120s backoff.
+func (s *SessionNotifier) OnTaskComplete(task model.Task) error {
+	result := task.Result
+	if result == "" {
+		result = "（无）"
+	}
+	msg := fmt.Sprintf("[agent-queue] ✅ 任务完成：%s\n执行人：%s\n结果：%s\ntask_id: %s",
+		task.Title, task.AssignedTo, result, task.ID)
+
+	label := "OnTaskComplete:" + task.ID
+	sendFn := func() error {
+		if err := s.client.SendToSession(s.ceoSessionKey, msg); err != nil {
+			log.Printf("[session_notifier] OnTaskComplete → %s failed: %v", s.ceoSessionKey, err)
+			return err
+		}
+		log.Printf("[session_notifier] OnTaskComplete task=%s: notified CEO", task.ID)
+		return nil
+	}
+	s.retryQ.Enqueue(label, sendFn)
+	return nil
+}

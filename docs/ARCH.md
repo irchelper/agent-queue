@@ -1,6 +1,6 @@
 # agent-queue 架构说明
 
-> 版本：v11 | 更新：2026-02-26 | 代码基线：commit `19535b2` — V11 agent_channel_map webhook路由 + stale max_dispatches限制
+> 版本：v11 | 更新：2026-02-27 | 代码基线：commit `34b43a0` — retry_routing UNIQUE INDEX 幂等性修复（seed INSERT OR IGNORE + migration 去重）
 > 对应 PRD：`PRD.md`
 
 ---
@@ -639,6 +639,11 @@ INSERT INTO retry_routing (assigned_to, error_keyword, retry_assigned_to, priori
      ORDER BY priority DESC LIMIT 1
 4. 无匹配 → SessionNotifier 唤醒 CEO（人工决策）
 ```
+
+**retry_routing 幂等性修复（commit 34b43a0，2026-02-26）：**
+server 重启时 seed 函数重复插入 retry_routing 记录，导致记录数从 16 增长到无限大，ticker 反复消费重复路由规则。
+**修复：** 为 `(assigned_to, error_keyword, retry_assigned_to)` 添加 UNIQUE INDEX；seed 函数改用 `INSERT OR IGNORE`；追加 migration 去重现有重复数据。
+重启后记录数稳定在 19（16 条标准 seed + 3 条历史补充），不再增长。
 
 ---
 

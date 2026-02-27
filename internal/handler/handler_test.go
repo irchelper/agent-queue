@@ -2670,3 +2670,121 @@ func TestV11_StaleTicker_BelowMax_NoCEOAlert(t *testing.T) {
 		}
 	}
 }
+
+// TestOnTaskComplete_SingleTask_NotifiesCEO verifies that when a single task
+// (no chain_id) with notify_ceo_on_complete=true is patched to done,
+// OnTaskComplete sends a CEO notification.
+func TestOnTaskComplete_SingleTask_NotifiesCEO(t *testing.T) {
+	var mu sync.Mutex
+	var ceoMessages []string
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if msg, ok := args["message"].(string); ok {
+				mu.Lock()
+				ceoMessages = append(ceoMessages, msg)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create a single task (no chain) with notify_ceo_on_complete=true.
+	r := postJSON(t, srv, "/tasks", map[string]any{
+		"title":                 "single-notify-task",
+		"assigned_to":           "coder",
+		"notify_ceo_on_complete": true,
+	})
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", r.StatusCode)
+	}
+	var task model.Task
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	// Drive to done.
+	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
+		map[string]any{"version": task.Version, "agent": "coder"})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed) //nolint:errcheck
+	claimR.Body.Close()
+	ip := patchTaskTo(t, srv, task.ID, "in_progress", claimed.Version)
+	patchTaskTo(t, srv, task.ID, "done", ip.Version)
+
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	snap := make([]string, len(ceoMessages))
+	copy(snap, ceoMessages)
+	mu.Unlock()
+
+	found := false
+	for _, msg := range snap {
+		if strings.Contains(msg, "single-notify-task") && strings.Contains(msg, "✅") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("CEO should have received OnTaskComplete notification, got: %v", snap)
+	}
+}
+
+// TestOnTaskComplete_SingleTask_NoChainNoNotify verifies that a single task
+// without notify_ceo_on_complete does NOT notify CEO on done.
+func TestOnTaskComplete_SingleTask_NoChainNoNotify(t *testing.T) {
+	var mu sync.Mutex
+	var ceoMessages []string
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		if args, ok := body["args"].(map[string]any); ok {
+			if msg, ok := args["message"].(string); ok {
+				mu.Lock()
+				ceoMessages = append(ceoMessages, msg)
+				mu.Unlock()
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create single task WITHOUT notify_ceo_on_complete.
+	r := postJSON(t, srv, "/tasks", map[string]any{
+		"title":       "no-notify-single-task",
+		"assigned_to": "coder",
+	})
+	var task model.Task
+	json.NewDecoder(r.Body).Decode(&task) //nolint:errcheck
+	r.Body.Close()
+
+	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
+		map[string]any{"version": task.Version, "agent": "coder"})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed) //nolint:errcheck
+	claimR.Body.Close()
+	ip := patchTaskTo(t, srv, task.ID, "in_progress", claimed.Version)
+	patchTaskTo(t, srv, task.ID, "done", ip.Version)
+
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	snap := make([]string, len(ceoMessages))
+	copy(snap, ceoMessages)
+	mu.Unlock()
+
+	for _, msg := range snap {
+		if strings.Contains(msg, "no-notify-single-task") {
+			t.Errorf("CEO should NOT be notified for task without notify_ceo_on_complete, got: %v", snap)
+		}
+	}
+}
