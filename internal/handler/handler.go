@@ -106,6 +106,7 @@ func (h *Handler) runStaleTicker() {
 			return
 		case <-ticker.C:
 			h.checkStaleTasks()
+			h.checkHumanTimeouts()
 		}
 	}
 }
@@ -163,6 +164,75 @@ func (h *Handler) checkStaleTasks() {
 			log.Printf("[stale_ticker] TouchUpdatedAt(%s): %v", c.ID, err)
 		}
 	}
+}
+
+// checkHumanTimeouts processes tasks assigned to "human" that have exceeded their
+// timeout_minutes threshold.
+//   - timeout_action = "escalate" → transition to blocked
+//   - timeout_action = "skip"     → transition to done (auto-skipped)
+//   - timeout_action = ""         → no action (let stale ticker handle)
+func (h *Handler) checkHumanTimeouts() {
+	tasks, err := h.store.ListTasks("pending", "human", "", nil)
+	if err != nil {
+		log.Printf("[human_timeout] ListTasks: %v", err)
+		return
+	}
+	now := time.Now().UTC()
+	for _, task := range tasks {
+		if task.TimeoutMinutes == nil || *task.TimeoutMinutes <= 0 {
+			continue
+		}
+		deadline := task.CreatedAt.Add(time.Duration(*task.TimeoutMinutes) * time.Minute)
+		if now.Before(deadline) {
+			continue
+		}
+		// Timed out — check action.
+		action := ""
+		if task.TimeoutAction != nil {
+			action = *task.TimeoutAction
+		}
+		switch action {
+		case "escalate":
+			// pending → claimed → in_progress → blocked (FSM requires intermediate steps)
+			if err := h.advanceHumanTask(task, model.StatusBlocked, "human timeout: escalated"); err != nil {
+				log.Printf("[human_timeout] escalate task %s: %v", task.ID, err)
+			} else {
+				log.Printf("[human_timeout] escalated task %s (%s)", task.ID, task.Title)
+			}
+		case "skip":
+			if err := h.advanceHumanTask(task, model.StatusDone, "human timeout: skipped"); err != nil {
+				log.Printf("[human_timeout] skip task %s: %v", task.ID, err)
+			} else {
+				log.Printf("[human_timeout] skipped task %s (%s)", task.ID, task.Title)
+			}
+		default:
+			// No automatic action.
+		}
+	}
+}
+
+// advanceHumanTask drives a pending human task through FSM states to reach targetStatus.
+// For done/blocked, the FSM path is: pending → claimed → in_progress → target.
+func (h *Handler) advanceHumanTask(task model.Task, targetStatus model.Status, result string) error {
+	ver := task.Version
+
+	claimedStatus := model.Status("claimed")
+	_, _, err := h.store.PatchTask(task.ID, model.PatchTaskRequest{Status: &claimedStatus, Version: ver, ChangedBy: "system"})
+	if err != nil {
+		return fmt.Errorf("claim: %w", err)
+	}
+	ver++
+
+	ipStatus := model.StatusInProgress
+	_, _, err = h.store.PatchTask(task.ID, model.PatchTaskRequest{Status: &ipStatus, Version: ver, ChangedBy: "system"})
+	if err != nil {
+		return fmt.Errorf("in_progress: %w", err)
+	}
+	ver++
+
+	r := result
+	_, _, err = h.store.PatchTask(task.ID, model.PatchTaskRequest{Status: &targetStatus, Result: &r, Version: ver, ChangedBy: "system"})
+	return err
 }
 
 // envDuration reads an environment variable as a duration; falls back to def.

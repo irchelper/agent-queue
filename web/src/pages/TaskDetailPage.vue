@@ -1,97 +1,207 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, onMounted, computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import AppLayout from '@/layouts/AppLayout.vue'
 import { api } from '@/api/client'
 import type { Task, TaskHistory } from '@/types'
 
 const route = useRoute()
+const router = useRouter()
 const task = ref<Task | null>(null)
 const history = ref<TaskHistory[]>([])
-const loading = ref(false)
+const loading = ref(true)
+const error = ref<string | null>(null)
 
-onMounted(async () => {
+async function load() {
   loading.value = true
+  error.value = null
   try {
-    const resp = await api.getTimeline(route.params.id as string)
+    const id = route.params.id as string
+    const resp = await api.getTimeline(id)
     task.value = resp.task
-    history.value = resp.history ?? []
-  } catch {
-    // fallback: just load task
-    task.value = await api.getTask(route.params.id as string)
+    // Reverse so newest first
+    history.value = [...(resp.history ?? [])].reverse()
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
   }
-})
-
-const statusColor: Record<string, string> = {
-  done: 'text-green-400',
-  failed: 'text-red-400',
-  in_progress: 'text-blue-400',
-  pending: 'text-yellow-400',
-  cancelled: 'text-slate-400',
-  blocked: 'text-orange-400',
-  review: 'text-purple-400',
-  claimed: 'text-cyan-400',
 }
+
+onMounted(load)
+
+function statusColor(status: string): string {
+  const map: Record<string, string> = {
+    done: 'bg-green-500/15 text-green-400 border-green-500/30',
+    failed: 'bg-red-500/15 text-red-400 border-red-500/30',
+    in_progress: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
+    pending: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30',
+    cancelled: 'bg-gray-700 text-gray-500 border-gray-600',
+    blocked: 'bg-orange-500/15 text-orange-400 border-orange-500/30',
+    review: 'bg-purple-500/15 text-purple-400 border-purple-500/30',
+    claimed: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30',
+  }
+  return map[status] ?? 'bg-gray-700 text-gray-400 border-gray-600'
+}
+
+function historyStatusColor(status: string): string {
+  const map: Record<string, string> = {
+    done: 'text-green-400',
+    failed: 'text-red-400',
+    in_progress: 'text-blue-400',
+    pending: 'text-yellow-400',
+    cancelled: 'text-gray-500',
+    blocked: 'text-orange-400',
+    review: 'text-purple-400',
+    claimed: 'text-cyan-400',
+  }
+  return map[status] ?? 'text-gray-400'
+}
+
+function historyDot(status: string): string {
+  const map: Record<string, string> = {
+    done: 'bg-green-400',
+    failed: 'bg-red-400',
+    in_progress: 'bg-blue-400',
+    pending: 'bg-yellow-400',
+    cancelled: 'bg-gray-600',
+    blocked: 'bg-orange-400',
+    review: 'bg-purple-400',
+    claimed: 'bg-cyan-400',
+  }
+  return map[status] ?? 'bg-gray-500'
+}
+
+function formatTime(iso: string): string {
+  const d = new Date(iso)
+  return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+const isHumanTask = computed(() => task.value?.assigned_to === 'human')
 </script>
 
 <template>
-  <div class="min-h-screen bg-slate-900 text-slate-100 p-6">
-    <button
-      class="text-sm text-slate-400 hover:text-white mb-4"
-      @click="$router.back()"
-    >← 返回</button>
+  <AppLayout>
+    <div class="max-w-4xl mx-auto p-6">
+      <!-- Back -->
+      <button
+        class="text-sm text-gray-500 hover:text-gray-300 mb-5 flex items-center gap-1"
+        @click="router.back()"
+      >← 返回</button>
 
-    <div v-if="loading" class="text-slate-500">加载中…</div>
-    <template v-else-if="task">
-      <div class="bg-slate-800 rounded-lg p-5 mb-6">
-        <div class="flex items-start justify-between gap-4">
-          <h1 class="text-xl font-bold">{{ task.title }}</h1>
-          <span
-            class="text-sm font-medium px-3 py-1 rounded shrink-0"
-            :class="[statusColor[task.status], 'bg-slate-700']"
-          >{{ task.status }}</span>
+      <div v-if="loading" class="text-gray-600 text-center py-20">加载中…</div>
+      <div v-else-if="error" class="p-4 bg-red-900/40 border border-red-500 rounded text-red-300">{{ error }}</div>
+
+      <div v-else-if="task" class="grid grid-cols-5 gap-6">
+        <!-- Left: Task detail (3/5) -->
+        <div class="col-span-3 space-y-4">
+          <div class="bg-gray-900 border border-gray-700 rounded-2xl p-5">
+            <!-- Title + status -->
+            <div class="flex items-start justify-between gap-3 mb-4">
+              <h1 class="text-lg font-bold text-gray-100 leading-snug flex-1">{{ task.title }}</h1>
+              <span
+                class="text-xs font-medium px-2.5 py-1 rounded-full border shrink-0"
+                :class="statusColor(task.status)"
+              >{{ task.status }}</span>
+            </div>
+
+            <!-- Meta grid -->
+            <div class="grid grid-cols-2 gap-3 text-sm mb-4">
+              <div>
+                <span class="text-gray-500 text-xs">执行人</span>
+                <div class="text-gray-200 mt-0.5 flex items-center gap-1">
+                  <span>{{ isHumanTask ? '👤' : '🤖' }}</span>
+                  {{ task.assigned_to }}
+                </div>
+              </div>
+              <div>
+                <span class="text-gray-500 text-xs">版本</span>
+                <div class="text-gray-200 mt-0.5">v{{ task.version }}</div>
+              </div>
+              <div>
+                <span class="text-gray-500 text-xs">创建时间</span>
+                <div class="text-gray-200 mt-0.5 text-xs">{{ formatTime(task.created_at) }}</div>
+              </div>
+              <div v-if="task.started_at">
+                <span class="text-gray-500 text-xs">开始时间</span>
+                <div class="text-gray-200 mt-0.5 text-xs">{{ formatTime(task.started_at as unknown as string) }}</div>
+              </div>
+              <div v-if="task.chain_id" class="col-span-2">
+                <span class="text-gray-500 text-xs">链路</span>
+                <div class="text-gray-400 mt-0.5 font-mono text-xs truncate cursor-pointer hover:text-gray-200"
+                  @click="$router.push('/goals')">
+                  {{ task.chain_id }}
+                </div>
+              </div>
+              <div v-if="task.timeout_minutes">
+                <span class="text-gray-500 text-xs">超时限制</span>
+                <div class="text-gray-200 mt-0.5">{{ task.timeout_minutes }} 分钟</div>
+              </div>
+            </div>
+
+            <!-- Description -->
+            <div v-if="task.description" class="mb-4">
+              <div class="text-xs text-gray-500 mb-1.5">描述</div>
+              <div class="bg-gray-800 rounded-lg p-3 text-sm text-gray-300 whitespace-pre-wrap leading-relaxed border border-gray-700/50">{{ task.description }}</div>
+            </div>
+
+            <!-- Result -->
+            <div v-if="task.result" class="mb-4">
+              <div class="text-xs text-gray-500 mb-1.5">执行结果</div>
+              <div class="bg-gray-800 rounded-lg p-3 text-sm text-gray-300 border border-gray-700/50">{{ task.result }}</div>
+            </div>
+
+            <!-- Failure reason -->
+            <div v-if="task.failure_reason" class="mb-4">
+              <div class="text-xs text-red-500 mb-1.5">失败原因</div>
+              <div class="bg-red-900/20 rounded-lg p-3 text-sm text-red-300 border border-red-700/30">{{ task.failure_reason }}</div>
+            </div>
+
+            <!-- Commit URL -->
+            <div v-if="task.commit_url">
+              <div class="text-xs text-gray-500 mb-1.5">Commit</div>
+              <a
+                :href="task.commit_url"
+                target="_blank"
+                rel="noopener"
+                class="text-blue-400 hover:text-blue-300 hover:underline text-sm break-all"
+              >{{ task.commit_url }}</a>
+            </div>
+          </div>
         </div>
-        <div class="mt-3 grid grid-cols-2 gap-2 text-sm text-slate-400">
-          <div>执行人：<span class="text-slate-200">{{ task.assigned_to }}</span></div>
-          <div>版本：<span class="text-slate-200">v{{ task.version }}</span></div>
-          <div>创建：<span class="text-slate-200">{{ new Date(task.created_at).toLocaleString() }}</span></div>
-          <div v-if="task.chain_id">链路：<span class="text-slate-200 font-mono text-xs">{{ task.chain_id }}</span></div>
-        </div>
-        <div v-if="task.description" class="mt-4 text-sm text-slate-300 whitespace-pre-wrap">
-          {{ task.description }}
-        </div>
-        <div v-if="task.result" class="mt-4 p-3 bg-slate-700 rounded text-sm">
-          <span class="text-slate-400">结果：</span>{{ task.result }}
-        </div>
-        <div v-if="task.commit_url" class="mt-2 text-sm">
-          <a :href="task.commit_url" target="_blank" class="text-blue-400 hover:underline">
-            {{ task.commit_url }}
-          </a>
+
+        <!-- Right: Timeline (2/5) -->
+        <div class="col-span-2">
+          <div class="bg-gray-900 border border-gray-700 rounded-2xl p-5">
+            <h2 class="text-sm font-semibold text-gray-300 mb-4 flex items-center gap-2">
+              <span>⏱</span> 时间线
+              <span class="text-xs text-gray-600 font-normal">（最新在上）</span>
+            </h2>
+
+            <div v-if="!history.length" class="text-gray-600 text-sm text-center py-6">无记录</div>
+
+            <div class="relative pl-4">
+              <!-- Vertical line -->
+              <div class="absolute left-1.5 top-2 bottom-2 border-l border-gray-700"></div>
+
+              <div v-for="h in history" :key="h.id" class="mb-4 relative">
+                <!-- Dot -->
+                <div
+                  class="absolute -left-4 top-1 w-2.5 h-2.5 rounded-full border-2 border-gray-900"
+                  :class="historyDot(h.to_status)"
+                />
+                <div class="text-xs text-gray-600 mb-0.5">{{ formatTime(h.changed_at) }}</div>
+                <div class="text-sm">
+                  <span v-if="h.from_status" class="text-gray-500 text-xs">{{ h.from_status }} → </span>
+                  <span class="font-medium" :class="historyStatusColor(h.to_status)">{{ h.to_status }}</span>
+                  <span v-if="h.changed_by" class="text-gray-600 text-xs ml-1">by {{ h.changed_by }}</span>
+                </div>
+                <div v-if="h.note" class="text-xs text-gray-500 mt-0.5">{{ h.note }}</div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
-
-      <!-- Timeline -->
-      <h2 class="text-lg font-semibold mb-3">⏱ 时间线</h2>
-      <div class="relative pl-6">
-        <div
-          v-for="(h, i) in history"
-          :key="h.id"
-          class="mb-4 relative"
-        >
-          <div class="absolute -left-6 top-1 w-3 h-3 rounded-full bg-slate-600 border-2 border-slate-400" />
-          <div v-if="i < history.length - 1" class="absolute -left-[18px] top-4 bottom-0 border-l border-slate-600" />
-          <div class="text-xs text-slate-500 mb-1">
-            {{ new Date(h.changed_at).toLocaleString() }}
-            <span v-if="h.changed_by" class="ml-2 text-slate-400">by {{ h.changed_by }}</span>
-          </div>
-          <div class="text-sm">
-            <span v-if="h.from_status" class="text-slate-400">{{ h.from_status }} → </span>
-            <span :class="statusColor[h.to_status] ?? 'text-slate-200'">{{ h.to_status }}</span>
-          </div>
-          <div v-if="h.note" class="text-xs text-slate-400 mt-1">{{ h.note }}</div>
-        </div>
-      </div>
-    </template>
-  </div>
+    </div>
+  </AppLayout>
 </template>

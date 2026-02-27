@@ -4,14 +4,15 @@ import DashboardPage from '@/pages/DashboardPage.vue'
 const router = createRouter({
   history: createWebHistory('/'),
   routes: [
+    { path: '/', name: 'dashboard', component: DashboardPage },
     {
-      path: '/',
-      name: 'dashboard',
-      component: DashboardPage,
+      path: '/goals/new',
+      name: 'goal-input',
+      component: () => import('@/pages/GoalInputPage.vue'),
     },
     {
       path: '/goals',
-      name: 'goals',
+      name: 'goal-tracking',
       component: () => import('@/pages/GoalTrackingPage.vue'),
     },
     {

@@ -1,19 +1,27 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, computed } from 'vue'
+import AppLayout from '@/layouts/AppLayout.vue'
+import { usePolling } from '@/composables/usePolling'
 import { api } from '@/api/client'
 import type { Task, TaskStatus } from '@/types'
 
 const allTasks = ref<Task[]>([])
-const loading = ref(false)
 
-const columns: { key: TaskStatus; label: string }[] = [
-  { key: 'pending', label: '待处理' },
-  { key: 'claimed', label: '已认领' },
-  { key: 'in_progress', label: '进行中' },
-  { key: 'review', label: '审核中' },
-  { key: 'done', label: '完成' },
-  { key: 'failed', label: '失败' },
-  { key: 'blocked', label: '阻塞' },
+async function fetchTasks() {
+  const resp = await api.listTasks({ limit: 500 })
+  allTasks.value = resp.tasks ?? []
+}
+
+const { loading, error, refresh } = usePolling(fetchTasks, 60_000)
+
+const columns: { key: TaskStatus; label: string; color: string }[] = [
+  { key: 'pending', label: '待处理', color: 'text-yellow-400' },
+  { key: 'claimed', label: '已认领', color: 'text-cyan-400' },
+  { key: 'in_progress', label: '进行中', color: 'text-blue-400' },
+  { key: 'review', label: '审核中', color: 'text-purple-400' },
+  { key: 'done', label: '完成', color: 'text-green-400' },
+  { key: 'blocked', label: '阻塞', color: 'text-orange-400' },
+  { key: 'failed', label: '失败', color: 'text-red-400' },
 ]
 
 const tasksByStatus = computed(() => {
@@ -24,41 +32,83 @@ const tasksByStatus = computed(() => {
   return map
 })
 
-onMounted(async () => {
-  loading.value = true
-  try {
-    const resp = await api.listTasks({ limit: 200 })
-    allTasks.value = resp.tasks ?? []
-  } finally {
-    loading.value = false
-  }
-})
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const m = Math.floor(diff / 60_000)
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m}分前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}时前`
+  return `${Math.floor(h / 24)}天前`
+}
+
+function agentBadge(assignedTo: string): string {
+  const isHuman = assignedTo === 'human'
+  return isHuman
+    ? 'bg-amber-500/20 text-amber-400'
+    : 'bg-gray-700 text-gray-400'
+}
 </script>
 
 <template>
-  <div class="min-h-screen bg-slate-900 text-slate-100 p-6">
-    <h1 class="text-2xl font-bold mb-6">📋 看板</h1>
-    <div v-if="loading" class="text-slate-500">加载中…</div>
-    <div v-else class="flex gap-4 overflow-x-auto pb-4">
-      <div
-        v-for="col in columns"
-        :key="col.key"
-        class="bg-slate-800 rounded-lg p-3 min-w-[200px] flex-shrink-0"
-      >
-        <div class="font-semibold text-sm mb-3 text-slate-300">
-          {{ col.label }}
-          <span class="ml-1 text-xs text-slate-500">({{ tasksByStatus[col.key]?.length ?? 0 }})</span>
+  <AppLayout>
+    <div class="p-6">
+      <div class="flex items-center justify-between mb-6">
+        <div>
+          <h1 class="text-xl font-bold text-gray-100">📋 看板</h1>
+          <p class="text-gray-500 text-sm mt-1">全局任务审计视图</p>
         </div>
+        <button
+          class="text-sm text-gray-500 hover:text-gray-300 disabled:opacity-40"
+          :disabled="loading"
+          @click="refresh"
+        >⟳ 刷新</button>
+      </div>
+
+      <div v-if="error" class="mb-4 p-3 bg-red-900/40 border border-red-500 rounded text-sm text-red-300">{{ error }}</div>
+      <div v-if="loading && !allTasks.length" class="text-gray-600 text-center py-20">加载中…</div>
+
+      <div v-else class="flex gap-3 overflow-x-auto pb-4">
         <div
-          v-for="task in tasksByStatus[col.key]"
-          :key="task.id"
-          class="bg-slate-700 rounded p-2 mb-2 text-sm cursor-pointer hover:bg-slate-600"
-          @click="$router.push(`/tasks/${task.id}`)"
+          v-for="col in columns"
+          :key="col.key"
+          class="bg-gray-900 border border-gray-800 rounded-xl flex-shrink-0 w-56 flex flex-col"
         >
-          <div class="truncate font-medium">{{ task.title }}</div>
-          <div class="text-xs text-slate-400 mt-1">{{ task.assigned_to }}</div>
+          <!-- Column header -->
+          <div class="px-3 py-3 border-b border-gray-800 flex items-center justify-between">
+            <span class="text-xs font-semibold" :class="col.color">{{ col.label }}</span>
+            <span class="text-xs text-gray-600 bg-gray-800 px-1.5 py-0.5 rounded-full">
+              {{ tasksByStatus[col.key]?.length ?? 0 }}
+            </span>
+          </div>
+
+          <!-- Tasks -->
+          <div class="flex-1 overflow-y-auto p-2 space-y-2 max-h-[calc(100vh-200px)]">
+            <div
+              v-for="task in tasksByStatus[col.key]"
+              :key="task.id"
+              class="bg-gray-800 hover:bg-gray-750 border border-gray-700/40 rounded-lg p-3 cursor-pointer hover:border-gray-600 transition-colors"
+              @click="$router.push(`/tasks/${task.id}`)"
+            >
+              <div class="text-xs font-medium text-gray-200 leading-snug mb-2 line-clamp-2">
+                {{ task.title }}
+              </div>
+              <div class="flex items-center justify-between gap-1">
+                <span
+                  class="text-xs px-1.5 py-0.5 rounded-md"
+                  :class="agentBadge(task.assigned_to)"
+                >
+                  {{ task.assigned_to === 'human' ? '👤' : '🤖' }} {{ task.assigned_to }}
+                </span>
+                <span class="text-xs text-gray-600">{{ relativeTime(task.updated_at) }}</span>
+              </div>
+            </div>
+            <div v-if="!tasksByStatus[col.key]?.length" class="text-center py-6 text-gray-700 text-xs">
+              空
+            </div>
+          </div>
         </div>
       </div>
     </div>
-  </div>
+  </AppLayout>
 </template>
