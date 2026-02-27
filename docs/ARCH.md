@@ -1225,3 +1225,127 @@ autoAdvance（V13）优先 > result routing（V14）
 ### result 字段兼容性
 
 非 JSON result（普通字符串）完全兼容，Go server 尝试 JSON parse 失败后直接跳过 result routing，行为与 V13 前一致。
+
+---
+
+## V15 — 任务模板 /dispatch/template（2026-02-27）
+
+> commit: `9fe2104`
+
+### 设计动机
+
+频繁使用的多步骤任务链（如"修复→QA→部署"）需要每次手动构造 chain 请求，重复且易出错。V15 引入任务模板系统，将常用链路固化为模板，一次调用即可展开。
+
+### 新增 Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS templates (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,       -- 模板唯一名称（如 "fix-qa-deploy"）
+    description TEXT NOT NULL,              -- 模板说明
+    tasks       TEXT NOT NULL,              -- JSON 数组：[{title, assigned_to, description}, ...]
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 新增 API 端点（5个）
+
+| 端点 | 说明 |
+|------|------|
+| `POST /templates` | 创建模板（name + description + tasks 数组）|
+| `GET /templates` | 列出所有模板 |
+| `GET /templates/:name` | 获取单个模板详情 |
+| `DELETE /templates/:name` | 删除模板 |
+| `POST /dispatch/from-template/:name` | 按模板创建并派发任务（支持变量替换）|
+
+### 内置子模板（3种）
+
+| 模板名 | 链路 | 用途 |
+|--------|------|------|
+| `fix-qa-deploy` | coder → qa → devops | 代码修复后的标准验证+部署流程 |
+| `doc-review` | writer → thinker | 文档起草后的架构师审核 |
+| `feature` | pm → coder → thinker → qa → devops | 完整功能开发链路 |
+
+### from-template 变量替换
+
+`POST /dispatch/from-template/:name` 请求体支持变量注入：
+
+```json
+{
+  "variables": {
+    "goal": "修复登录超时 bug",
+    "context": "复现步骤：...",
+    "branch": "fix/login-timeout"
+  },
+  "notify_ceo_on_complete": true,
+  "chain_title": "登录超时修复链路"
+}
+```
+
+模板中的 `{goal}`、`{context}` 等占位符自动替换为变量值。
+
+**展开规则：**
+- 模板含多个 task → 自动创建 chain（等同 `POST /dispatch/chain`）
+- 模板含单个 task → 创建普通任务（等同 `POST /dispatch`）
+- 变量未提供时占位符保留原样（不报错）
+
+---
+
+## V16 — agent 任务超时自动处理（2026-02-27）
+
+> commit: `2e36f38`
+
+### 设计动机
+
+agent 任务进入 `in_progress` 后可能因 session 崩溃、网络中断等原因长期不汇报。现有 stale ticker 只处理 `pending` 任务（重派）；V16 扩展为也处理 `in_progress` 超时，自动标记失败并通知 CEO。
+
+### 实现：扩展现有 stale ticker
+
+复用 `internal/handler/stale_ticker.go` 的定时扫描机制，追加 agent 超时检测逻辑：
+
+```
+每 10min tick（AGENT_QUEUE_STALE_CHECK_INTERVAL）：
+  1. 现有：pending + unclaimed > stale_threshold → re-dispatch
+  2. 新增：in_progress + started_at 超过 agent_timeout_minutes → PATCH failed
+```
+
+### 超时触发流程
+
+```
+扫描 in_progress 任务：
+  started_at + agent_timeout_minutes < now
+  AND assigned_to != "human"          // 人工任务不自动超时
+  AND timeout_action != "skip"        // 配置为 skip 时不自动处理
+  ↓
+PATCH status=failed
+  failure_reason="agent_timeout: exceeded {N}min SLA"
+  ↓
+触发 handleFailedTask：
+  retry_routing 匹配 → 自动改派
+  无匹配 → SessionNotifier.OnFailed → CEO session
+```
+
+### 配置
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `config.agent_timeout_minutes` | `90` | agent 任务超时阈值（分钟）；0 = 禁用 |
+| 任务级 `timeout_minutes` 字段 | — | 覆盖全局配置（V12 schema 新增字段）|
+| 任务级 `timeout_action` 字段 | `escalate` | `escalate`=通知CEO；`skip`=静默丢弃 |
+
+**配置文件示例：**
+```yaml
+timeouts:
+  agent_minutes: 90     # 全局 agent 超时（V16 新增）
+  stale_check_interval: 10m
+  stale_threshold: 30m
+```
+
+### 与 stale 任务的区别
+
+| 场景 | 状态 | 处理方式 |
+|------|------|---------|
+| 任务未被认领（pending 超时）| pending | re-dispatch（已有，V11）|
+| agent 认领后无响应（in_progress 超时）| in_progress | PATCH failed → retry/CEO（V16 新增）|
+| 人工任务超时 | in_progress（human）| 不处理（CEO 负责）|
