@@ -10,7 +10,7 @@ Single binary. Zero external dependencies. Runs on your laptop.
 
 ---
 
-## 5-Minute Quickstart
+## Quick Start
 
 ```bash
 # 1. Clone and build
