@@ -1,0 +1,850 @@
+openapi: 3.0.3
+info:
+  title: agent-queue API
+  description: |
+    AI-native task queue for multi-agent orchestration.
+    Supports task lifecycle management, chain dispatch, retry routing, and workbench UI.
+  version: "0.12.0"
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:19827
+    description: Local development
+
+tags:
+  - name: health
+    description: Server health
+  - name: tasks
+    description: Task lifecycle CRUD
+  - name: dispatch
+    description: Single task and chain dispatch
+  - name: routing
+    description: Retry routing rules
+  - name: chains
+    description: Task chain queries
+  - name: workbench
+    description: AI Workbench UI aggregation endpoints (P1/P2)
+
+# ─────────────────────────────────────────────
+# Reusable schemas
+# ─────────────────────────────────────────────
+components:
+  schemas:
+    TaskStatus:
+      type: string
+      enum: [pending, claimed, in_progress, review, done, failed, blocked, cancelled]
+      description: Task FSM state
+
+    Task:
+      type: object
+      required: [id, title, status, version, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          example: "1897f68382d84620"
+        title:
+          type: string
+          example: "实现 OnTaskComplete"
+        description:
+          type: string
+          example: "修复单任务 notify_ceo_on_complete 不触发问题"
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        assigned_to:
+          type: string
+          example: "coder"
+        retry_assigned_to:
+          type: string
+          example: "thinker"
+        superseded_by:
+          type: string
+          description: ID of the replacement task (auto-retry creates a new task)
+        chain_id:
+          type: string
+          example: "chain_1897f68382d83298"
+        notify_ceo_on_complete:
+          type: boolean
+          default: false
+        stale_dispatch_count:
+          type: integer
+          default: 0
+        parent_id:
+          type: string
+        mode:
+          type: string
+        requires_review:
+          type: boolean
+          default: false
+        result:
+          type: string
+          example: "OnTaskComplete实现完成，2测试通过"
+        failure_reason:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+          example: 4
+        priority:
+          type: integer
+          default: 0
+        timeout_minutes:
+          type: integer
+          nullable: true
+          description: Human task timeout in minutes; null = no timeout
+          example: 60
+        timeout_action:
+          type: string
+          nullable: true
+          enum: [escalate, skip, null]
+          description: Action on timeout; escalate→blocked, skip→done
+        commit_url:
+          type: string
+          nullable: true
+          format: uri
+          example: "https://github.com/irchelper/agent-queue/commit/e2f142a"
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        depends_on:
+          type: array
+          items:
+            type: string
+          description: List of task IDs this task depends on
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryItem'
+
+    HistoryItem:
+      type: object
+      required: [id, task_id, to_status, changed_at]
+      properties:
+        id:
+          type: integer
+        task_id:
+          type: string
+        from_status:
+          type: string
+        to_status:
+          type: string
+        changed_by:
+          type: string
+        note:
+          type: string
+        changed_at:
+          type: string
+          format: date-time
+
+    RetryRoute:
+      type: object
+      required: [id, assigned_to, error_keyword, retry_assigned_to, priority]
+      properties:
+        id:
+          type: integer
+        assigned_to:
+          type: string
+          example: "coder"
+        error_keyword:
+          type: string
+          example: "架构"
+        retry_assigned_to:
+          type: string
+          example: "thinker"
+        priority:
+          type: integer
+          example: 10
+
+    ChainRequest:
+      type: object
+      required: [tasks]
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/CreateTaskRequest'
+        notify_ceo_on_complete:
+          type: boolean
+          default: false
+        chain_title:
+          type: string
+
+    CreateTaskRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        assigned_to:
+          type: string
+        retry_assigned_to:
+          type: string
+        chain_id:
+          type: string
+        notify_ceo_on_complete:
+          type: boolean
+          default: false
+        parent_id:
+          type: string
+        mode:
+          type: string
+        requires_review:
+          type: boolean
+          default: false
+        priority:
+          type: integer
+          default: 0
+        timeout_minutes:
+          type: integer
+          nullable: true
+        timeout_action:
+          type: string
+          nullable: true
+          enum: [escalate, skip]
+        commit_url:
+          type: string
+          nullable: true
+          format: uri
+        depends_on:
+          type: array
+          items:
+            type: string
+
+    PatchTaskRequest:
+      type: object
+      required: [version]
+      properties:
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        result:
+          type: string
+        failure_reason:
+          type: string
+        retry_assigned_to:
+          type: string
+        commit_url:
+          type: string
+          nullable: true
+          format: uri
+        note:
+          type: string
+        changed_by:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+
+    DispatchRequest:
+      type: object
+      required: [title, assigned_to]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        assigned_to:
+          type: string
+        notify_ceo_on_complete:
+          type: boolean
+          default: false
+        priority:
+          type: integer
+          default: 0
+        requires_review:
+          type: boolean
+          default: false
+        timeout_minutes:
+          type: integer
+          nullable: true
+        timeout_action:
+          type: string
+          nullable: true
+        commit_url:
+          type: string
+          nullable: true
+          format: uri
+        depends_on:
+          type: array
+          items:
+            type: string
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "task not found"
+
+    DashboardStats:
+      type: object
+      properties:
+        total:
+          type: integer
+        pending:
+          type: integer
+        in_progress:
+          type: integer
+        done:
+          type: integer
+        failed:
+          type: integer
+        blocked:
+          type: integer
+
+    AgentInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnprocessableEntity:
+      description: Business rule violation (e.g. invalid FSM transition)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Version conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+# ─────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────
+paths:
+
+  # ── Health ────────────────────────────────
+  /health:
+    get:
+      tags: [health]
+      summary: Server health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  database:
+                    type: string
+                    example: ok
+
+  # ── Tasks ─────────────────────────────────
+  /tasks:
+    get:
+      tags: [tasks]
+      summary: List tasks with optional filters
+      operationId: listTasks
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/TaskStatus'
+        - name: assigned_to
+          in: query
+          schema:
+            type: string
+        - name: parent_id
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        "200":
+          description: Task list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  total:
+                    type: integer
+
+    post:
+      tags: [tasks]
+      summary: Create a new task
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        "201":
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+
+  /tasks/poll:
+    get:
+      tags: [tasks]
+      summary: Poll for next pending task for a given agent
+      operationId: pollTask
+      parameters:
+        - name: assigned_to
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Next pending task (null if none available)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    nullable: true
+                    oneOf:
+                      - $ref: '#/components/schemas/Task'
+                      - type: "null"
+
+  /tasks/summary:
+    get:
+      tags: [tasks]
+      summary: Status count summary for all tasks
+      operationId: getTasksSummary
+      responses:
+        "200":
+          description: Summary counts by status
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: integer
+                example:
+                  pending: 3
+                  in_progress: 2
+                  done: 15
+                  failed: 1
+
+  /tasks/{id}:
+    get:
+      tags: [tasks]
+      summary: Get a task by ID
+      operationId: getTask
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Task detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [tasks]
+      summary: Update task status or fields
+      operationId: patchTask
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchTaskRequest'
+      responses:
+        "200":
+          description: Updated task with triggered downstream IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    $ref: '#/components/schemas/Task'
+                  triggered:
+                    type: array
+                    items:
+                      type: string
+                  blocked_downstream:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        title:
+                          type: string
+                        assigned_to:
+                          type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /tasks/{id}/claim:
+    post:
+      tags: [tasks]
+      summary: Claim a pending task (pending → claimed)
+      operationId: claimTask
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                agent:
+                  type: string
+                version:
+                  type: integer
+      responses:
+        "200":
+          description: Claimed task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /tasks/{id}/deps-met:
+    get:
+      tags: [tasks]
+      summary: Check if all dependencies of a task are satisfied
+      operationId: checkDepsMet
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deps status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deps_met:
+                    type: boolean
+                  task_id:
+                    type: string
+
+  # ── Dispatch ──────────────────────────────
+  /dispatch:
+    post:
+      tags: [dispatch]
+      summary: Dispatch a single task (create + notify agent session)
+      operationId: dispatchTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchRequest'
+      responses:
+        "201":
+          description: Dispatched task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+
+  /dispatch/chain:
+    post:
+      tags: [dispatch]
+      summary: Dispatch a chain of tasks with sequential dependencies
+      operationId: dispatchChain
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChainRequest'
+      responses:
+        "201":
+          description: Created chain
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chain_id:
+                    type: string
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+
+  # ── Retry Routing ─────────────────────────
+  /retry-routing:
+    get:
+      tags: [routing]
+      summary: List all retry routing rules
+      operationId: listRetryRoutes
+      responses:
+        "200":
+          description: All routing rules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  routes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RetryRoute'
+
+    post:
+      tags: [routing]
+      summary: Create a retry routing rule
+      operationId: createRetryRoute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assigned_to, retry_assigned_to]
+              properties:
+                assigned_to:
+                  type: string
+                error_keyword:
+                  type: string
+                  default: ""
+                retry_assigned_to:
+                  type: string
+                priority:
+                  type: integer
+                  default: 0
+      responses:
+        "201":
+          description: Created routing rule
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetryRoute'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+
+  /retry-routing/{id}:
+    delete:
+      tags: [routing]
+      summary: Delete a retry routing rule
+      operationId: deleteRetryRoute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # ── Chains ────────────────────────────────
+  /chains/{chain_id}:
+    get:
+      tags: [chains]
+      summary: Get chain status (all tasks + completion flag)
+      operationId: getChainStatus
+      parameters:
+        - name: chain_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Chain status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chain_id:
+                    type: string
+                  complete:
+                    type: boolean
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # ── Workbench API ─────────────────────────
+  /api/dashboard:
+    get:
+      tags: [workbench]
+      summary: Aggregated dashboard data (todo + exceptions + stats)
+      operationId: getDashboard
+      responses:
+        "200":
+          description: Dashboard data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  todo:
+                    type: array
+                    description: Pending tasks (all assigned_to values)
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  exceptions:
+                    type: array
+                    description: Failed and blocked tasks
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  stats:
+                    $ref: '#/components/schemas/DashboardStats'
+
+  /api/timeline/{id}:
+    get:
+      tags: [workbench]
+      summary: Task detail with full history timeline
+      operationId: getTimeline
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Task + history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    $ref: '#/components/schemas/Task'
+                  history:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HistoryItem'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /api/chains:
+    get:
+      tags: [workbench]
+      summary: All task chains grouped by chain_id
+      operationId: getAPIChains
+      responses:
+        "200":
+          description: Chain groups
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chains:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        chain_id:
+                          type: string
+                        tasks:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/Task'
+
+  /api/config:
+    get:
+      tags: [workbench]
+      summary: Frontend configuration (known agents, server version)
+      operationId: getConfig
+      responses:
+        "200":
+          description: Config data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentInfo'
+                  version:
+                    type: string
+                    example: "v12"
