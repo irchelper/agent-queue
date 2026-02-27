@@ -1102,8 +1102,9 @@ func (h *Handler) tasksPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /tasks/summary
-func (h *Handler) tasksSummary(w http.ResponseWriter, _ *http.Request) {
-	summary, err := h.store.Summary()
+func (h *Handler) tasksSummary(w http.ResponseWriter, r *http.Request) {
+	assignedTo := r.URL.Query().Get("assigned_to")
+	summary, err := h.store.SummaryFiltered(assignedTo)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

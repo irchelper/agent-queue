@@ -130,6 +130,32 @@ async function reject() {
     rejecting.value = false
   }
 }
+
+// Priority
+const priorityOptions = [
+  { value: 0, label: '普通', color: 'text-gray-400' },
+  { value: 1, label: '⬆ 高', color: 'text-blue-400' },
+  { value: 2, label: '🔴 紧急', color: 'text-red-400' },
+]
+const updatingPriority = ref(false)
+const priorityError = ref<string | null>(null)
+
+async function updatePriority(value: number) {
+  if (!task.value) return
+  updatingPriority.value = true
+  priorityError.value = null
+  try {
+    const resp = await api.patchTask(task.value.id, {
+      priority: value,
+      version: task.value.version,
+    })
+    task.value = resp.task
+  } catch (e) {
+    priorityError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    updatingPriority.value = false
+  }
+}
 </script>
 
 <template>
@@ -188,6 +214,23 @@ async function reject() {
               <div v-if="task.timeout_minutes">
                 <span class="text-gray-500 text-xs">超时限制</span>
                 <div class="text-gray-200 mt-0.5">{{ task.timeout_minutes }} 分钟</div>
+              </div>
+              <!-- Priority selector -->
+              <div>
+                <span class="text-gray-500 text-xs">优先级</span>
+                <div class="flex items-center gap-1.5 mt-1">
+                  <button
+                    v-for="opt in priorityOptions"
+                    :key="opt.value"
+                    class="text-xs px-2 py-0.5 rounded-md border transition-colors"
+                    :class="task.priority === opt.value
+                      ? 'border-blue-500/60 bg-blue-500/10 ' + opt.color
+                      : 'border-gray-700 text-gray-600 hover:border-gray-500 hover:text-gray-400'"
+                    :disabled="updatingPriority"
+                    @click="updatePriority(opt.value)"
+                  >{{ opt.label }}</button>
+                </div>
+                <div v-if="priorityError" class="text-xs text-red-400 mt-1">{{ priorityError }}</div>
               </div>
             </div>
 

@@ -90,6 +90,7 @@ type PatchTaskRequest struct {
 	FailureReason   *string `json:"failure_reason"`    // written on in_progress→failed
 	RetryAssignedTo *string `json:"retry_assigned_to"` // set by CEO before failed→pending retry
 	CommitURL       *string `json:"commit_url"`        // V12: optional commit URL
+	Priority        *int    `json:"priority"`          // V19: dynamic priority (0=normal,1=high,2=urgent)
 	Note            string  `json:"note"`
 	ChangedBy       string  `json:"changed_by"`
 	Version         int     `json:"version"`

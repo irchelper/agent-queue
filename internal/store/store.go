@@ -119,7 +119,7 @@ func (s *Store) listTasksInternal(status, assignedTo, parentID, search string, d
 				 t.auto_advance_to, t.advance_task_title, t.advance_task_description
 	          FROM tasks t
 	          WHERE ` + strings.Join(where, " AND ") + `
-	          ORDER BY t.created_at ASC`
+	          ORDER BY t.priority DESC, t.created_at ASC`
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -347,6 +347,12 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 	if req.CommitURL != nil {
 		setClauses = append(setClauses, "commit_url = ?")
 		args = append(args, *req.CommitURL)
+	}
+
+	// V19: priority can be updated at any time regardless of FSM state.
+	if req.Priority != nil {
+		setClauses = append(setClauses, "priority = ?")
+		args = append(args, *req.Priority)
 	}
 
 	args = append(args, id)
@@ -641,10 +647,23 @@ func (s *Store) DeleteRetryRoute(id int) error {
 // -------------------------------------------------------------------
 
 // Summary returns a compact view of active tasks and done-today count.
+// Summary returns aggregate counts for all tasks (no filter).
 func (s *Store) Summary() (model.SummaryResponse, error) {
-	// Count per-status (all statuses).
-	rows, err := s.db.Query(`
-		SELECT status, COUNT(*) FROM tasks GROUP BY status`)
+	return s.SummaryFiltered("")
+}
+
+// SummaryFiltered returns aggregate counts optionally filtered by assigned_to.
+func (s *Store) SummaryFiltered(assignedTo string) (model.SummaryResponse, error) {
+	whereClause := ""
+	args := []any{}
+	if assignedTo != "" {
+		whereClause = " WHERE assigned_to = ?"
+		args = append(args, assignedTo)
+	}
+	// Count per-status.
+	rows, err := s.db.Query(
+		`SELECT status, COUNT(*) FROM tasks`+whereClause+` GROUP BY status`,
+		args...)
 	if err != nil {
 		return model.SummaryResponse{}, fmt.Errorf("summary counts: %w", err)
 	}
@@ -677,18 +696,31 @@ func (s *Store) Summary() (model.SummaryResponse, error) {
 	// Done today: tasks done since the start of today (UTC).
 	// We compare against midnight UTC using substr to handle Go's RFC3339 format.
 	todayStart := time.Now().UTC().Truncate(24 * time.Hour)
-	err = s.db.QueryRow(`
-		SELECT COUNT(*) FROM tasks
-		WHERE status = 'done' AND updated_at >= ?`, todayStart).Scan(&resp.DoneToday)
+	doneTodayWhere := "status = 'done' AND updated_at >= ?"
+	doneTodayArgs := []any{todayStart}
+	if assignedTo != "" {
+		doneTodayWhere += " AND assigned_to = ?"
+		doneTodayArgs = append(doneTodayArgs, assignedTo)
+	}
+	err = s.db.QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE `+doneTodayWhere,
+		doneTodayArgs...,
+	).Scan(&resp.DoneToday)
 	if err != nil {
 		return model.SummaryResponse{}, fmt.Errorf("done_today count: %w", err)
 	}
 
 	// Active tasks list (non-terminal), sorted by updated_at DESC.
-	taskRows, err := s.db.Query(`
-		SELECT id, title, status, assigned_to, updated_at FROM tasks
-		WHERE status NOT IN ('done', 'cancelled')
-		ORDER BY updated_at DESC`)
+	activeWhere := "status NOT IN ('done', 'cancelled')"
+	activeArgs := []any{}
+	if assignedTo != "" {
+		activeWhere += " AND assigned_to = ?"
+		activeArgs = append(activeArgs, assignedTo)
+	}
+	taskRows, err := s.db.Query(
+		`SELECT id, title, status, assigned_to, updated_at FROM tasks WHERE `+activeWhere+` ORDER BY updated_at DESC`,
+		activeArgs...,
+	)
 	if err != nil {
 		return model.SummaryResponse{}, fmt.Errorf("active tasks: %w", err)
 	}
