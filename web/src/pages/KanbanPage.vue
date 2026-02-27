@@ -67,7 +67,7 @@ function cardClass(task: Task): string {
 
 <template>
   <AppLayout>
-    <div class="p-6">
+    <div class="p-3 md:p-6">
       <div class="flex items-center justify-between mb-6">
         <div>
           <h1 class="text-xl font-bold text-gray-100">📋 看板</h1>

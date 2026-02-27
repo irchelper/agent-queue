@@ -136,6 +136,58 @@ function statusBadgeClass(status: string): string {
   }
   return map[status] ?? 'bg-gray-700 text-gray-400'
 }
+
+// V22: Bulk operations
+const selectedIds = ref<Set<string>>(new Set())
+const bulkLoading = ref(false)
+const bulkError = ref<string | null>(null)
+const reassignTarget = ref('')
+
+function toggleSelect(id: string) {
+  const s = new Set(selectedIds.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  selectedIds.value = s
+}
+
+function clearSelection() {
+  selectedIds.value = new Set()
+  reassignTarget.value = ''
+  bulkError.value = null
+}
+
+async function bulkAction(action: 'cancel' | 'reassign') {
+  if (!selectedIds.value.size) return
+  if (action === 'reassign' && !reassignTarget.value.trim()) {
+    bulkError.value = '请输入重新分配的 agent 名称'
+    return
+  }
+  bulkLoading.value = true
+  bulkError.value = null
+  try {
+    const body: Record<string, unknown> = {
+      action,
+      task_ids: Array.from(selectedIds.value),
+    }
+    if (action === 'reassign') body.assigned_to = reassignTarget.value.trim()
+    const resp = await fetch('/api/tasks/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const data = await resp.json()
+    if (!resp.ok) throw new Error(data.error ?? `HTTP ${resp.status}`)
+    if (data.failed > 0) {
+      bulkError.value = `${data.failed} 个任务操作失败`
+    }
+    clearSelection()
+    await store.fetch()
+  } catch (e) {
+    bulkError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    bulkLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -199,7 +251,7 @@ function statusBadgeClass(status: string): string {
       </div>
     </div>
 
-    <div class="grid grid-cols-2 gap-0 h-full">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-0">
       <!-- Left: Human Todo -->
       <div class="border-r border-gray-800 flex flex-col">
         <div class="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
@@ -295,6 +347,38 @@ function statusBadgeClass(status: string): string {
             >{{ exceptionCount }}</span>
           </div>
         </div>
+
+        <!-- V22: Bulk toolbar -->
+        <div
+          v-if="selectedIds.size > 0"
+          class="px-4 py-2.5 bg-blue-950/40 border-b border-blue-500/20 flex items-center gap-2 flex-wrap"
+        >
+          <span class="text-xs text-blue-400 font-medium">已选 {{ selectedIds.size }} 个</span>
+          <button
+            class="text-xs px-3 py-1.5 bg-red-800/60 hover:bg-red-700/60 text-red-300 rounded-lg transition-colors disabled:opacity-50"
+            :disabled="bulkLoading"
+            @click="bulkAction('cancel')"
+          >✖ 批量取消</button>
+          <div class="flex items-center gap-1.5">
+            <input
+              v-model="reassignTarget"
+              type="text"
+              placeholder="agent 名称…"
+              class="text-xs bg-gray-800 border border-gray-600 rounded-lg px-2 py-1.5 text-gray-200 w-24 focus:outline-none focus:border-blue-500"
+            />
+            <button
+              class="text-xs px-3 py-1.5 bg-blue-800/60 hover:bg-blue-700/60 text-blue-300 rounded-lg transition-colors disabled:opacity-50"
+              :disabled="bulkLoading || !reassignTarget.trim()"
+              @click="bulkAction('reassign')"
+            >↩ 重新分配</button>
+          </div>
+          <button
+            class="text-xs text-gray-500 hover:text-gray-300 ml-auto"
+            @click="clearSelection"
+          >✕ 清除</button>
+          <div v-if="bulkError" class="w-full text-xs text-red-400">{{ bulkError }}</div>
+        </div>
+
         <div class="flex-1 overflow-y-auto p-4 space-y-3">
           <div v-if="exceptions.length === 0" class="text-center text-gray-600 py-12">
             <div class="text-4xl mb-3">✅</div>
@@ -304,10 +388,20 @@ function statusBadgeClass(status: string): string {
           <div
             v-for="task in exceptions"
             :key="task.id"
-            class="bg-gray-900 border border-gray-700/60 rounded-xl p-4 hover:border-red-500/30 transition-colors cursor-pointer"
+            class="bg-gray-900 border rounded-xl p-4 transition-colors cursor-pointer"
+            :class="selectedIds.has(task.id)
+              ? 'border-blue-500/50 bg-blue-500/5'
+              : 'border-gray-700/60 hover:border-red-500/30'"
             @click="$router.push(`/tasks/${task.id}`)"
           >
-            <div class="flex items-start justify-between gap-3 mb-2">
+            <div class="flex items-start gap-3 mb-2">
+              <!-- Checkbox -->
+              <input
+                type="checkbox"
+                class="mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-800 accent-blue-500 cursor-pointer shrink-0"
+                :checked="selectedIds.has(task.id)"
+                @click.stop="toggleSelect(task.id)"
+              />
               <div class="flex-1 min-w-0">
                 <h3 class="font-medium text-gray-100 text-sm mb-1.5 truncate">{{ task.title }}</h3>
                 <div class="flex items-center gap-2 flex-wrap">
