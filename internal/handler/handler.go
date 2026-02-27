@@ -1480,7 +1480,7 @@ func (h *Handler) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, Response{
 		Agents:             agents,
-		Version:            "v23",
+		Version:            "v27",
 		OutboundWebhookURL: outboundWebhookURL,
 	})
 }
