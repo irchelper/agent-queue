@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRouter } from 'vue-router'
 import AppLayout from '@/layouts/AppLayout.vue'
+import KeyboardHelpModal from '@/components/KeyboardHelpModal.vue'
 import { usePolling } from '@/composables/usePolling'
 import { useSSE } from '@/composables/useSSE'
-
-const { t } = useI18n()
+import { useKeyboardNav } from '@/composables/useKeyboardNav'
 import { api } from '@/api/client'
 import type { Task, TaskStatus } from '@/types'
+
+const { t } = useI18n()
+useRouter() // ensure router is available for useKeyboardNav
 
 const allTasks = ref<Task[]>([])
 
@@ -20,6 +24,15 @@ const { loading, error, refresh } = usePolling(fetchTasks, 60_000)
 
 // V17: SSE real-time updates — refresh board on any task event.
 const { connected: sseConnected } = useSSE(() => fetchTasks(), { fallbackInterval: 60_000 })
+
+// V26-A: keyboard navigation across all visible tasks (flattened)
+const { selectedIndex: kbIndex, showHelp: showKbHelp } = useKeyboardNav(
+  () => allTasks.value,
+  async (id, data) => {
+    await api.patchTask(id, data)
+    await fetchTasks()
+  }
+)
 
 const columns: { key: TaskStatus; label: string; color: string }[] = [
   { key: 'pending', label: '待处理', color: 'text-yellow-400' },
@@ -37,6 +50,13 @@ const tasksByStatus = computed(() => {
     map[col.key] = allTasks.value.filter((t) => t.status === col.key)
   }
   return map
+})
+
+// V26-A: map task.id → index in allTasks for keyboard highlight
+const taskIndexMap = computed(() => {
+  const m: Record<string, number> = {}
+  allTasks.value.forEach((t, i) => { m[t.id] = i })
+  return m
 })
 
 function relativeTime(iso: string): string {
@@ -70,6 +90,8 @@ function cardClass(task: Task): string {
 
 <template>
   <AppLayout>
+    <!-- V26-A: keyboard help modal -->
+    <KeyboardHelpModal :show="showKbHelp" @close="showKbHelp = false" />
     <div class="p-3 md:p-6">
       <div class="flex items-center justify-between mb-6">
         <div>
@@ -112,7 +134,8 @@ function cardClass(task: Task): string {
             <div
               v-for="task in tasksByStatus[col.key]"
               :key="task.id"
-              :class="cardClass(task)"
+              :data-keyboard-index="taskIndexMap[task.id]"
+              :class="[cardClass(task), kbIndex === taskIndexMap[task.id] ? 'ring-2 ring-blue-500' : '']"
               @click="$router.push(`/tasks/${task.id}`)"
             >
               <!-- Human task badge -->
