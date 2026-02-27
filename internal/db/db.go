@@ -36,7 +36,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at               DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   timeout_minutes          INTEGER,
   timeout_action           VARCHAR,
-  commit_url               VARCHAR
+  commit_url               VARCHAR,
+  auto_advance_to          TEXT NOT NULL DEFAULT '',
+  advance_task_title       TEXT NOT NULL DEFAULT '',
+  advance_task_description TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS retry_routing (
@@ -93,6 +96,10 @@ func Open(path string) (*sql.DB, error) {
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN timeout_minutes INTEGER`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN timeout_action VARCHAR`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN commit_url VARCHAR`)
+	// V13: autoAdvance – success path dispatch (+3 fields).
+	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN auto_advance_to TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN advance_task_title TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN advance_task_description TEXT NOT NULL DEFAULT ''`)
 
 	// Deduplicate retry_routing: keep the earliest row per (assigned_to, error_keyword) pair,
 	// then add a UNIQUE index so INSERT OR IGNORE works correctly going forward.

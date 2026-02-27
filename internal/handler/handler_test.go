@@ -2788,3 +2788,153 @@ func TestOnTaskComplete_SingleTask_NoChainNoNotify(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// V13: autoAdvance tests
+// ---------------------------------------------------------------------------
+
+// TestV13_AutoAdvance_NoField verifies that when auto_advance_to is empty,
+// no downstream advance task is created on PATCH done.
+func TestV13_AutoAdvance_NoField(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	// Create task without auto_advance_to
+	dispR := postJSON(t, srv, "/dispatch", map[string]any{
+		"title":       "v13-no-advance",
+		"assigned_to": "coder",
+	})
+	if dispR.StatusCode != http.StatusCreated {
+		t.Fatalf("dispatch: want 201, got %d", dispR.StatusCode)
+	}
+	var dispResp struct{ Task model.Task }
+	json.NewDecoder(dispR.Body).Decode(&dispResp)
+	dispR.Body.Close()
+	task := dispResp.Task
+
+	// claim → in_progress → done
+	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
+		map[string]any{"version": task.Version, "agent": "coder"})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed)
+	claimR.Body.Close()
+
+	ip := patchTaskTo(t, srv, task.ID, "in_progress", claimed.Version)
+	patchTaskTo(t, srv, task.ID, "done", ip.Version)
+
+	time.Sleep(200 * time.Millisecond)
+
+	// No advance tasks should exist
+	listR := getJSON(t, srv, "/tasks?assigned_to=coder")
+	var listResp struct{ Tasks []model.Task }
+	json.NewDecoder(listR.Body).Decode(&listResp)
+	listR.Body.Close()
+	for _, tt := range listResp.Tasks {
+		if strings.HasPrefix(tt.Title, "advance:") {
+			t.Errorf("unexpected advance task: %q", tt.Title)
+		}
+	}
+}
+
+// TestV13_AutoAdvance_CreatesNextTask verifies that when auto_advance_to is set,
+// PATCH done creates and dispatches a new task to the target agent with upstream
+// result injected into description.
+func TestV13_AutoAdvance_CreatesNextTask(t *testing.T) {
+	mockOC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true}) //nolint:errcheck
+	}))
+	defer mockOC.Close()
+	oc := openclaw.NewWithURL(mockOC.URL, "")
+	srv := newTestServer(t, oc)
+	defer srv.Close()
+
+	const advanceAgent = "qa"
+	const advanceTitle = "QA验证阶段"
+	const advanceDesc = "请验证coder的实现"
+	const upstreamResult = "实现完成：commit abc123"
+
+	// Create task with auto_advance_to
+	dispR := postJSON(t, srv, "/dispatch", map[string]any{
+		"title":                    "v13-advance-source",
+		"assigned_to":              "coder",
+		"auto_advance_to":          advanceAgent,
+		"advance_task_title":       advanceTitle,
+		"advance_task_description": advanceDesc,
+	})
+	if dispR.StatusCode != http.StatusCreated {
+		t.Fatalf("dispatch: want 201, got %d", dispR.StatusCode)
+	}
+	var dispResp struct{ Task model.Task }
+	json.NewDecoder(dispR.Body).Decode(&dispResp)
+	dispR.Body.Close()
+	task := dispResp.Task
+
+	// Verify auto_advance_to was stored correctly
+	if task.AutoAdvanceTo != advanceAgent {
+		t.Fatalf("auto_advance_to: want %q, got %q", advanceAgent, task.AutoAdvanceTo)
+	}
+
+	// claim → in_progress → done (with result)
+	claimR := postJSON(t, srv, "/tasks/"+task.ID+"/claim",
+		map[string]any{"version": task.Version, "agent": "coder"})
+	var claimed model.Task
+	json.NewDecoder(claimR.Body).Decode(&claimed)
+	claimR.Body.Close()
+
+	ip := patchTaskTo(t, srv, task.ID, "in_progress", claimed.Version)
+
+	// PATCH done with result
+	doneBody, _ := json.Marshal(map[string]any{
+		"status":  "done",
+		"result":  upstreamResult,
+		"version": ip.Version,
+	})
+	doneReq, _ := http.NewRequest(http.MethodPatch, srv.URL+"/tasks/"+task.ID, bytes.NewReader(doneBody))
+	doneReq.Header.Set("Content-Type", "application/json")
+	doneR, err := http.DefaultClient.Do(doneReq)
+	if err != nil {
+		t.Fatalf("PATCH done: %v", err)
+	}
+	doneR.Body.Close()
+
+	// Wait for async autoAdvance goroutine
+	time.Sleep(400 * time.Millisecond)
+
+	// Find the advance task for qa
+	listR := getJSON(t, srv, "/tasks?assigned_to="+advanceAgent)
+	var listResp struct{ Tasks []model.Task }
+	json.NewDecoder(listR.Body).Decode(&listResp)
+	listR.Body.Close()
+
+	var found *model.Task
+	for i := range listResp.Tasks {
+		if listResp.Tasks[i].Title == advanceTitle {
+			found = &listResp.Tasks[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("advance task %q not found in tasks: %v", advanceTitle, listResp.Tasks)
+	}
+
+	// Verify assigned_to
+	if found.AssignedTo != advanceAgent {
+		t.Errorf("advance task assigned_to=%q, want %q", found.AssignedTo, advanceAgent)
+	}
+
+	// Verify description contains upstream result and advance_task_description
+	if !strings.Contains(found.Description, upstreamResult) {
+		t.Errorf("description missing upstream result; desc=%q", found.Description)
+	}
+	if !strings.Contains(found.Description, advanceDesc) {
+		t.Errorf("description missing advance_task_description; desc=%q", found.Description)
+	}
+	if !strings.Contains(found.Description, "前置结果：") {
+		t.Errorf("description missing 前置结果 prefix; desc=%q", found.Description)
+	}
+}

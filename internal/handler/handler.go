@@ -327,16 +327,19 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 
 	// Create task.
 	task, err := h.store.CreateTask(model.CreateTaskRequest{
-		Title:               req.Title,
-		Description:         req.Description,
-		AssignedTo:          req.AssignedTo,
-		RequiresReview:      req.RequiresReview,
-		DependsOn:           req.DependsOn,
-		NotifyCEOOnComplete: req.NotifyCEOOnComplete,
-		Priority:            req.Priority,
-		CommitURL:           req.CommitURL,
-		TimeoutMinutes:      req.TimeoutMinutes,
-		TimeoutAction:       req.TimeoutAction,
+		Title:                  req.Title,
+		Description:            req.Description,
+		AssignedTo:             req.AssignedTo,
+		RequiresReview:         req.RequiresReview,
+		DependsOn:              req.DependsOn,
+		NotifyCEOOnComplete:    req.NotifyCEOOnComplete,
+		Priority:               req.Priority,
+		CommitURL:              req.CommitURL,
+		TimeoutMinutes:         req.TimeoutMinutes,
+		TimeoutAction:          req.TimeoutAction,
+		AutoAdvanceTo:          req.AutoAdvanceTo,
+		AdvanceTaskTitle:       req.AdvanceTaskTitle,
+		AdvanceTaskDescription: req.AdvanceTaskDescription,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -648,6 +651,12 @@ func (h *Handler) patchTask(w http.ResponseWriter, r *http.Request, id string) {
 				}
 			}(task.ChainID)
 		}
+
+		// V13 autoAdvance: success-path dispatch symmetric to autoRetry.
+		// When auto_advance_to is set, automatically create and dispatch the next task.
+		if task.AutoAdvanceTo != "" {
+			h.autoAdvance(task)
+		}
 	}
 
 	var blockedDownstream []model.BlockedDownstream
@@ -821,6 +830,56 @@ func (h *Handler) autoRetryReviewReject(original, origDetail model.Task, retryAg
 	// Dispatch only the fix task; re-review will be dispatched automatically
 	// when fix task reaches 'done' (unlockDependents → triggered → SessionNotifier.Dispatch).
 	h.dispatchToAgent(retryAgent, fixTask.ID)
+}
+
+// autoAdvance creates and dispatches the next task when a task completes with
+// auto_advance_to set. Symmetric to autoRetry (fail path).
+//
+// Behaviour:
+//   - New task title: advance_task_title (or "advance: <original.Title>" as fallback)
+//   - New task description: if advance_task_description is set, prepend upstream result:
+//     "前置结果：{result}\n\n{advance_task_description}"
+//     Otherwise use just the upstream result as context.
+//   - Inherits ChainID, Priority, NotifyCEOOnComplete from original.
+//   - Does NOT inherit DependsOn (the new task depends only on the original being done,
+//     which is implicit by the time autoAdvance fires).
+func (h *Handler) autoAdvance(original model.Task) {
+	go func() {
+		advanceAgent := original.AutoAdvanceTo
+
+		title := original.AdvanceTaskTitle
+		if title == "" {
+			title = "advance: " + original.Title
+		}
+
+		desc := original.AdvanceTaskDescription
+		upstreamResult := original.Result
+		if upstreamResult == "" {
+			upstreamResult = "（无）"
+		}
+		if desc != "" {
+			desc = "前置结果：" + upstreamResult + "\n\n" + desc
+		} else {
+			desc = "前置结果：" + upstreamResult
+		}
+
+		newTask, err := h.store.CreateTask(model.CreateTaskRequest{
+			Title:               title,
+			AssignedTo:          advanceAgent,
+			Description:         desc,
+			Priority:            original.Priority,
+			ChainID:             original.ChainID,
+			NotifyCEOOnComplete: original.NotifyCEOOnComplete,
+		})
+		if err != nil {
+			log.Printf("[handler] autoAdvance CreateTask failed for original %s: %v", original.ID, err)
+			return
+		}
+		log.Printf("[handler] autoAdvance: created task %s for agent %s (original: %s)",
+			newTask.ID, advanceAgent, original.ID)
+
+		h.dispatchToAgent(advanceAgent, newTask.ID)
+	}()
 }
 
 // dispatchToAgent sends a sessions_send nudge to the agent owning taskID.

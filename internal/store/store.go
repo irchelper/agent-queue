@@ -38,12 +38,14 @@ func (s *Store) CreateTask(req model.CreateTaskRequest) (model.Task, error) {
 		                   chain_id, notify_ceo_on_complete,
 		                   parent_id, mode, requires_review, priority, version,
 		                   timeout_minutes, timeout_action, commit_url,
+		                   auto_advance_to, advance_task_title, advance_task_description,
 		                   created_at, updated_at)
-		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, req.Title, req.Description, req.AssignedTo, req.RetryAssignedTo,
 		req.ChainID, boolToInt(req.NotifyCEOOnComplete),
 		req.ParentID, req.Mode, boolToInt(req.RequiresReview), req.Priority,
 		req.TimeoutMinutes, req.TimeoutAction, req.CommitURL,
+		req.AutoAdvanceTo, req.AdvanceTaskTitle, req.AdvanceTaskDescription,
 		now, now)
 	if err != nil {
 		return model.Task{}, fmt.Errorf("insert task: %w", err)
@@ -97,7 +99,8 @@ func (s *Store) ListTasks(status, assignedTo, parentID string, depsMetFilter *bo
 	query := `SELECT t.id, t.title, t.description, t.status, t.assigned_to, t.retry_assigned_to, t.superseded_by,
 	                 t.chain_id, t.notify_ceo_on_complete, t.stale_dispatch_count, t.parent_id,
 	                 t.mode, t.requires_review, t.result, t.failure_reason, t.version, t.priority, t.started_at, t.created_at, t.updated_at,
-				 t.timeout_minutes, t.timeout_action, t.commit_url
+				 t.timeout_minutes, t.timeout_action, t.commit_url,
+				 t.auto_advance_to, t.advance_task_title, t.advance_task_description
 	          FROM tasks t
 	          WHERE ` + strings.Join(where, " AND ") + `
 	          ORDER BY t.created_at ASC`
@@ -147,7 +150,8 @@ func (s *Store) GetByID(id string) (model.Task, error) {
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
 		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id,
 		       mode, requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at,
-		       timeout_minutes, timeout_action, commit_url
+		       timeout_minutes, timeout_action, commit_url,
+		       auto_advance_to, advance_task_title, advance_task_description
 		FROM tasks WHERE id = ?`, id)
 
 	t, err := scanTaskRow(row)
@@ -248,7 +252,8 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
 		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id,
 		       mode, requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at,
-		       timeout_minutes, timeout_action, commit_url
+		       timeout_minutes, timeout_action, commit_url,
+		       auto_advance_to, advance_task_title, advance_task_description
 		FROM tasks WHERE id = ?`, id)
 
 	current, err := scanTaskRow(row)
@@ -471,7 +476,8 @@ func (s *Store) GetChainTasks(chainID string) ([]model.Task, error) {
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
 		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id, mode,
 		       requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at,
-		       timeout_minutes, timeout_action, commit_url
+		       timeout_minutes, timeout_action, commit_url,
+		       auto_advance_to, advance_task_title, advance_task_description
 		FROM tasks WHERE chain_id = ?
 		ORDER BY created_at ASC`, chainID)
 	if err != nil {
@@ -701,7 +707,8 @@ func (s *Store) Poll(assignedTo string) (*model.Task, error) {
 		SELECT id, title, description, status, assigned_to, retry_assigned_to, superseded_by,
 		       chain_id, notify_ceo_on_complete, stale_dispatch_count, parent_id, mode,
 		       requires_review, result, failure_reason, version, priority, started_at, created_at, updated_at,
-		       timeout_minutes, timeout_action, commit_url
+		       timeout_minutes, timeout_action, commit_url,
+		       auto_advance_to, advance_task_title, advance_task_description
 		FROM tasks
 		WHERE status = 'pending' AND assigned_to = ?
 		ORDER BY priority DESC, created_at ASC
@@ -953,7 +960,8 @@ func scanTaskImpl(r taskScanner) (model.Task, error) {
 		&t.ParentID, &t.Mode, &rr,
 		&t.Result, &t.FailureReason, &t.Version, &t.Priority,
 		&t.StartedAt, &t.CreatedAt, &t.UpdatedAt,
-		&t.TimeoutMinutes, &t.TimeoutAction, &t.CommitURL)
+		&t.TimeoutMinutes, &t.TimeoutAction, &t.CommitURL,
+		&t.AutoAdvanceTo, &t.AdvanceTaskTitle, &t.AdvanceTaskDescription)
 	if err != nil {
 		return model.Task{}, err
 	}

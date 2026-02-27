@@ -36,10 +36,13 @@ type Task struct {
 	Version               int        `json:"version"`
 	Priority              int        `json:"priority"`
 	StaleDispatchCount    int        `json:"stale_dispatch_count,omitempty"`
-	TimeoutMinutes        *int       `json:"timeout_minutes,omitempty"`
-	TimeoutAction         *string    `json:"timeout_action,omitempty"`
-	CommitURL             *string    `json:"commit_url,omitempty"`
-	StartedAt             *time.Time `json:"started_at,omitempty"`
+	TimeoutMinutes           *int       `json:"timeout_minutes,omitempty"`
+	TimeoutAction            *string    `json:"timeout_action,omitempty"`
+	CommitURL                *string    `json:"commit_url,omitempty"`
+	AutoAdvanceTo            string     `json:"auto_advance_to,omitempty"`
+	AdvanceTaskTitle         string     `json:"advance_task_title,omitempty"`
+	AdvanceTaskDescription   string     `json:"advance_task_description,omitempty"`
+	StartedAt                *time.Time `json:"started_at,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 	UpdatedAt             time.Time  `json:"updated_at"`
 
@@ -71,10 +74,13 @@ type CreateTaskRequest struct {
 	Mode                  string   `json:"mode"`
 	RequiresReview        bool     `json:"requires_review"`
 	Priority              int      `json:"priority"`
-	TimeoutMinutes        *int     `json:"timeout_minutes"`
-	TimeoutAction         *string  `json:"timeout_action"`
-	CommitURL             *string  `json:"commit_url"`
-	DependsOn             []string `json:"depends_on"`
+	TimeoutMinutes           *int     `json:"timeout_minutes"`
+	TimeoutAction            *string  `json:"timeout_action"`
+	CommitURL                *string  `json:"commit_url"`
+	AutoAdvanceTo            string   `json:"auto_advance_to"`
+	AdvanceTaskTitle         string   `json:"advance_task_title"`
+	AdvanceTaskDescription   string   `json:"advance_task_description"`
+	DependsOn                []string `json:"depends_on"`
 }
 
 // PatchTaskRequest is the body for PATCH /tasks/:id.
@@ -134,11 +140,14 @@ type DispatchRequest struct {
 	RequiresReview      bool     `json:"requires_review"`
 	DependsOn           []string `json:"depends_on"`
 	Result              string   `json:"result"`
-	NotifyCEOOnComplete bool     `json:"notify_ceo_on_complete"`
-	Priority            int      `json:"priority"`
-	CommitURL           *string  `json:"commit_url"`
-	TimeoutMinutes      *int     `json:"timeout_minutes"`
-	TimeoutAction       *string  `json:"timeout_action"`
+	NotifyCEOOnComplete      bool     `json:"notify_ceo_on_complete"`
+	Priority                 int      `json:"priority"`
+	CommitURL                *string  `json:"commit_url"`
+	TimeoutMinutes           *int     `json:"timeout_minutes"`
+	TimeoutAction            *string  `json:"timeout_action"`
+	AutoAdvanceTo            string   `json:"auto_advance_to"`
+	AdvanceTaskTitle         string   `json:"advance_task_title"`
+	AdvanceTaskDescription   string   `json:"advance_task_description"`
 }
 
 // DispatchResponse wraps the created task and a flag indicating whether the
