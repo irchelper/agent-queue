@@ -1,9 +1,9 @@
 # agent-queue PRD
 
-> Status: Draft → v11
+> Status: Draft → v12
 > Owner: 产品经理
 > Date: 2026-02-25
-> Updated: 2026-02-27 (v11 — 新增 F17 SessionNotifier 内存重试队列（CEO通知3次/30s-60s-120s backoff）、F18 stale任务自动re-dispatch（10min ticker/30min阈值）；代码基线：commit `e2f142a` — OnTaskComplete 单任务 notify_ceo_on_complete 支持)
+> Updated: 2026-02-27 (v12 — AI-native 工作台架构确认：前端技术选型锁定（Vue3+TS+Vite+Tailwind），Monorepo，embed.FS，手写OpenAPI，YAML config；代码基线：commit `e2f142a` — OnTaskComplete 单任务 notify_ceo_on_complete 支持)
 
 ---
 
@@ -862,7 +862,7 @@ LIMIT 20
 | 排除项 | 原因 |
 |--------|------|
 | **认证/鉴权（API token / OAuth）** | v1 仅本机调用，信任模型足够；v2 若需远程访问再加 |
-| **Web UI / Dashboard** | API 给 agent 用，不是给人用；CLI 工具或 cURL 已满足调试需求 |
+| ~~**Web UI / Dashboard**~~ | ~~API 给 agent 用，不是给人用；CLI 工具或 cURL 已满足调试需求~~ **→ 已纳入 v12 AI Workbench（Vue3+TS+Vite+Tailwind，embed.FS 单二进制）** |
 | **WebSocket 实时推送** | v1 用 Incoming Webhook（HTTP POST）推送；WebSocket 双向通道 v2 再评估 |
 | **分布式部署 / 多节点** | SQLite 是单机数据库，v1 定位本机使用；若需多机，v2 换 PostgreSQL |
 | **任务超时自动处理** | v1 依赖人工/cron 检测超时任务；v2 加 `timeout` 字段 + 自动释放 |
@@ -871,6 +871,35 @@ LIMIT 20
 | **通用 Webhook 回调** | v1 内置 Discord Incoming Webhook（F6）；v2 加通用 webhook 配置（任意 URL + 自定义 payload） |
 | **SDK / Client Library** | v1 纯 HTTP API + cURL；v2 按需出 Go/Python/TS client |
 | **指标 / Prometheus** | v1 用日志 + health endpoint；v2 加 /metrics |
+
+---
+
+## 12. v12 AI Workbench 架构确认（2026-02-27）
+
+> 架构方案：`~/.openclaw/workspaces/thinker/docs/2026-02-27-ai-workbench-arch.md`
+
+### 技术选型锁定
+
+- **前端框架**：Vue 3 + TypeScript + Vite + Tailwind CSS（Pinia + Vue Router + Vitest）
+- **前端嵌入**：embed.FS，单二进制部署不变（`make build` → 含前端的完整二进制）
+- **Repo 策略**：Monorepo（前端 `web/` 目录，不拆独立 repo）
+- **OpenAPI**：手写 `docs/api/openapi.yaml`，openapi-typescript-codegen 生成前端 client
+- **配置系统**：`internal/config/`，YAML + 环境变量，不引入 Viper
+- **新增 API 前缀**：`/api/`（现有 `/tasks`、`/dispatch` 等路径 100% 不变）
+
+### Schema 扩展（+3 字段）
+
+```sql
+ALTER TABLE tasks ADD COLUMN timeout_minutes INTEGER NULL;
+ALTER TABLE tasks ADD COLUMN timeout_action VARCHAR NULL;  -- 'escalate' | 'skip'
+ALTER TABLE tasks ADD COLUMN commit_url VARCHAR NULL;
+```
+
+### 分期方案
+
+- **P1（~3天）**：web/ 脚手架 + config 包 + embed.FS + schema +3 字段 + 新 API 端点
+- **P2（~5天）**：Dashboard/Goal/Kanban/Timeline 核心页面 + 超时 ticker
+- **P3（~2天）**：README 重写 + CONTRIBUTING.md + OpenAPI spec + CI/CD
 
 ---
 

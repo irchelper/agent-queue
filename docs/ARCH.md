@@ -970,3 +970,151 @@ POST /dispatch/graph
 **V11 尚未实现。** 现阶段使用手动多次 POST 或 `/dispatch/chain`（线性链）替代。V11 实现后，线性链 `/dispatch/chain` 将成为 `/dispatch/graph` 的 DAG 退化形式（仍保留向后兼容）。
 
 **实现预期复杂度：** store.go 新增 `CreateGraph` 事务方法（~60 行）+ handler.go 新增路由（~40 行）+ 客户端 id→task_id 映射逻辑（~30 行）。
+
+---
+
+## V12 — AI-native 工作台架构
+
+> 设计文档：`~/.openclaw/workspaces/thinker/docs/2026-02-27-ai-workbench-arch.md`
+> 代码基线：commit `6b3d9f6`（当前）→ AI Workbench 新增
+> 架构师：🧠 thinker | 日期：2026-02-27
+
+### 设计目标
+
+从 agent-queue（纯 API server, ~7000 行 Go）扩展为全栈 AI-native 工作台：
+
+- 前端 SPA 嵌入 Go 二进制（`embed.FS`），单二进制部署不变
+- 开源就绪：陌生人 clone → build → run，5 分钟上手
+- 不破坏现有 API（100% 后向兼容）
+- 不绑定 OpenClaw——可配置化（config.yaml 控制开关）
+
+### 核心技术决策
+
+| 决策点 | 选择 | 否决备选 |
+|--------|------|---------|
+| Repo 策略 | Monorepo（留在 agent-queue） | Multi-repo（发布流程复杂，开源体验差）|
+| 前端框架 | Vue 3 + TypeScript | React; htmx（htmx 扩展性差）|
+| UI 库 | Tailwind CSS + 自建组件 | Element Plus; Naive UI（开源不绑 UI 库，bundle 小）|
+| 构建工具 | Vite | Webpack |
+| 前端嵌入 | embed.FS | 分离部署（单二进制是核心卖点）|
+| 配置系统 | YAML + 环境变量 | Viper（依赖重，30+ 传递依赖）|
+| OpenAPI | 手写 `docs/api/openapi.yaml` | swaggo 注解（handler 代码膨胀 30%+）|
+| API client | openapi-typescript-codegen 生成 | 手写（类型安全 + 减少维护量）|
+
+### 新增目录结构
+
+```
+agent-queue/
+├── web/                        # 前端 SPA 源码
+│   ├── src/
+│   │   ├── api/                # API client（从 OpenAPI 生成）
+│   │   ├── components/         # UI 组件（dashboard/timeline/kanban/forms/common）
+│   │   ├── composables/        # usePolling, useTask 等
+│   │   ├── pages/              # DashboardPage/GoalInputPage/KanbanPage/TaskDetailPage
+│   │   ├── stores/             # Pinia 状态管理（task/dashboard/chain/config）
+│   │   └── types/              # TypeScript 类型定义
+│   ├── package.json
+│   ├── vite.config.ts          # API 代理（开发模式）+ outDir=../dist
+│   └── tsconfig.json
+├── dist/                       # 构建产物（gitignore），embed.FS 读取点
+├── docs/api/
+│   └── openapi.yaml            # OpenAPI 3.0 手写 spec（全部端点）
+├── internal/config/            # YAML 配置加载（新增）
+│   ├── config.go               # Config struct + Load()（~120 行）
+│   └── config_test.go
+└── .github/workflows/          # CI/CD
+    ├── test.yml                # push/PR → Go test + 前端 test
+    ├── build.yml               # push main → 跨平台构建（4 平台）
+    └── release.yml             # tag v* → GitHub Release
+```
+
+### 前端技术栈
+
+| 层 | 选型 | 版本 |
+|----|------|------|
+| 框架 | Vue 3 | ^3.5 |
+| 语言 | TypeScript | ^5.5 |
+| 构建 | Vite | ^6 |
+| 样式 | Tailwind CSS | ^4 |
+| 状态管理 | Pinia | ^2.2 |
+| 路由 | Vue Router | ^4.4 |
+| HTTP | fetch + 生成的 client | 原生 |
+| 测试 | Vitest + Vue Test Utils | ^3 |
+
+### Go Server 扩展
+
+**Schema 新增 3 字段（幂等 ALTER TABLE）：**
+```sql
+ALTER TABLE tasks ADD COLUMN timeout_minutes INTEGER NULL;
+ALTER TABLE tasks ADD COLUMN timeout_action VARCHAR NULL;  -- 'escalate' | 'skip'
+ALTER TABLE tasks ADD COLUMN commit_url VARCHAR NULL;
+```
+
+**新增 API 端点（/api/ 前缀，现有端点路径不变）：**
+
+| 端点 | 说明 | 改动量 |
+|------|------|--------|
+| `GET /` | SPA 入口（embed.FS + SPA fallback） | ~30 行 |
+| `GET /api/dashboard` | 聚合查询：待办+异常+目标概览 | ~60 行 |
+| `GET /api/timeline/:id` | 任务时间线（task_history 格式化） | ~40 行 |
+| `GET /api/chains` | 链路列表（目标追踪用） | ~30 行 |
+| `GET /api/config` | 前端获取可配项（已知 agents 等） | ~15 行 |
+| `PATCH /tasks/:id` | 扩展 commit_url / timeout_* 字段 | ~15 行修改 |
+
+**embed.FS 集成（cmd/server/main.go）：**
+```go
+//go:embed all:dist
+var webFS embed.FS
+
+// --static-dir=path 开发模式，读本地文件
+// 不传 → 用 embed.FS（生产模式）
+// 非 API 路径 + 非静态文件 → 返回 index.html（SPA 路由兜底）
+```
+
+**后端改动总量：~545 行**（config 新增 ~200 行 + handler/store/model/db 修改 ~345 行）
+
+### 配置系统（internal/config）
+
+加载优先级：命令行 flag > 环境变量 > config.yaml > 默认值
+
+```yaml
+server:
+  port: 19827
+  db: data/queue.db
+agents:
+  known:
+    - {name: coder, label: 工程师}  # 从配置读取，不硬编码
+timeouts:
+  agent_minutes: 30
+  stale_check_interval: 10m
+  stale_threshold: 30m
+notifications:
+  webhook_url: ""
+  openclaw_url: http://localhost:18789
+  openclaw_key: ""
+web:
+  static_dir: ""  # 空=embed.FS；非空=开发模式本地路径
+```
+
+**向后兼容：** 所有现有环境变量继续生效；无配置文件时行为不变。不引入 Viper（依赖重）。
+
+### 分期实施方案
+
+| 阶段 | 内容 | 估时 | 主要执行者 |
+|------|------|------|-----------|
+| P1 骨架 | web/ 脚手架 + config 包 + embed.FS + schema +3 字段 + 新 API 端点 | ~3 天 | coder + qa |
+| P2 核心页面 | Dashboard/Goal/Kanban/Timeline + 超时 ticker + 前端测试 | ~5 天 | coder + uiux + qa |
+| P3 开源就绪 | README 重写 + CONTRIBUTING.md + OpenAPI spec + CI/CD | ~2 天 | writer + devops + qa |
+
+**总估算：~10 天**（P1/P2 coder 与 uiux 可并行；P3 writer 与 coder 可并行）
+
+### 风险与缓解
+
+| 风险 | 级别 | 缓解 |
+|------|------|------|
+| embed.FS 增大二进制 | 低 | 前端 gzip 后 <100KB，二进制增加 <1MB |
+| Go embed 行为变化 | 低 | embed.FS 从 Go 1.16 稳定，无 breaking change 历史 |
+| 前端构建增加 CI 时间 | 低 | npm ci ~30s + vite build ~10s，总增加 <1min |
+| OpenAPI spec 与代码不同步 | 中 | CI 中加 spec 校验步骤（响应 schema 匹配测试）|
+| handler.go 膨胀 | 低 | 当前 962→~1160 行，<1500 行红线不拆；超线再拆 |
+| Tailwind v4 breaking change | 低 | v4 已稳定；锁 package-lock.json 版本 |

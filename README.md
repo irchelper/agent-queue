@@ -2,7 +2,7 @@
 
 # agent-queue
 
-**Stop babysitting your AI agents.** agent-queue is a lightweight task queue that lets multiple AI agents coordinate autonomously — no central orchestrator required.
+**Stop babysitting your AI agents.** agent-queue is a lightweight task queue with an AI-native workbench UI that lets multiple AI agents coordinate autonomously — no central orchestrator required.
 
 Agents poll for work, claim tasks atomically, and report completion via HTTP. Serial chains run end-to-end without human intervention: when task A finishes, task B unlocks automatically; the next agent picks it up on its next poll cycle.
 
@@ -33,6 +33,7 @@ agent-queue moves task state out of agent memory and into SQLite. Any agent can 
 - **F13 — Review-reject two-stage chain (V10)**: When thinker/security/vision fails a task and routes to a different agent, autoRetry creates a `fix task → re-review task` two-stage chain; downstream deps block until re-review approves. Supports multi-level reject via `UpdateSupersededByChain`
 - **F14 — Extended retry_routing seed (V10.1)**: 16 seed rules covering vision/pm/ops default routing; vision added to `isReviewReject` reviewer list
 - **F19 — Single-task CEO notification (e2f142a)**: `POST /dispatch` and `POST /tasks` now support `notify_ceo_on_complete: true` for standalone tasks (no chain required); uses the same RetryQueue backoff (30s/60s/120s) as chain completion
+- **Web UI (v12)** — Built-in SPA dashboard (Vue 3 + TypeScript + Vite + Tailwind); single binary includes frontend via embed.FS; pages: Dashboard, Goal Tracking, Kanban, Task Timeline
 
 ## Quick Start
 
