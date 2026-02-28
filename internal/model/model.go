@@ -42,6 +42,7 @@ type Task struct {
 	AutoAdvanceTo            string     `json:"auto_advance_to,omitempty"`
 	AdvanceTaskTitle         string     `json:"advance_task_title,omitempty"`
 	AdvanceTaskDescription   string     `json:"advance_task_description,omitempty"`
+	SpecFile                 string     `json:"spec_file,omitempty"`
 	StartedAt                *time.Time `json:"started_at,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 	UpdatedAt             time.Time  `json:"updated_at"`
@@ -80,6 +81,7 @@ type CreateTaskRequest struct {
 	AutoAdvanceTo            string   `json:"auto_advance_to"`
 	AdvanceTaskTitle         string   `json:"advance_task_title"`
 	AdvanceTaskDescription   string   `json:"advance_task_description"`
+	SpecFile                 string   `json:"spec_file,omitempty"`
 	DependsOn                []string `json:"depends_on"`
 }
 
@@ -149,6 +151,9 @@ type DispatchRequest struct {
 	AutoAdvanceTo            string   `json:"auto_advance_to"`
 	AdvanceTaskTitle         string   `json:"advance_task_title"`
 	AdvanceTaskDescription   string   `json:"advance_task_description"`
+	// SpecFile is an optional path to a local file containing the full task spec.
+	// When set, the file contents are read server-side and prepended to Description.
+	SpecFile                 string   `json:"spec_file,omitempty"`
 }
 
 // DispatchResponse wraps the created task and a flag indicating whether the

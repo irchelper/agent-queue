@@ -117,6 +117,8 @@ func Open(path string) (*sql.DB, error) {
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN auto_advance_to TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN advance_task_title TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN advance_task_description TEXT NOT NULL DEFAULT ''`)
+	// V30-v4: spec_file — stores path to a local spec file for long task descriptions
+	_, _ = db.Exec(`ALTER TABLE tasks ADD COLUMN spec_file TEXT NOT NULL DEFAULT ''`)
 
 	// Deduplicate retry_routing: keep the earliest row per (assigned_to, error_keyword) pair,
 	// then add a UNIQUE index so INSERT OR IGNORE works correctly going forward.

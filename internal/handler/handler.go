@@ -439,10 +439,33 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// V30-v4: spec_file support — read file contents and prepend to description.
+	description := req.Description
+	specFilePath := strings.TrimSpace(req.SpecFile)
+	if specFilePath != "" {
+		// Expand ~ to home directory.
+		if strings.HasPrefix(specFilePath, "~/") {
+			home, err := os.UserHomeDir()
+			if err == nil {
+				specFilePath = filepath.Join(home, specFilePath[2:])
+			}
+		}
+		specContent, err := os.ReadFile(specFilePath)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("spec_file read error: %v", err))
+			return
+		}
+		if description != "" {
+			description = string(specContent) + "\n\n---\n" + description
+		} else {
+			description = string(specContent)
+		}
+	}
+
 	// Create task.
 	task, err := h.store.CreateTask(model.CreateTaskRequest{
 		Title:                  req.Title,
-		Description:            req.Description,
+		Description:            description,
 		AssignedTo:             req.AssignedTo,
 		RequiresReview:         req.RequiresReview,
 		DependsOn:              req.DependsOn,
@@ -454,6 +477,7 @@ func (h *Handler) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		AutoAdvanceTo:          req.AutoAdvanceTo,
 		AdvanceTaskTitle:       req.AdvanceTaskTitle,
 		AdvanceTaskDescription: req.AdvanceTaskDescription,
+		SpecFile:               req.SpecFile,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
