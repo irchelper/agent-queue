@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1748,7 +1749,7 @@ func (h *Handler) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, Response{
 		Agents:             agents,
-		Version:            "v28",
+		Version:            gitDescribe(),
 		OutboundWebhookURL: outboundWebhookURL,
 		DBPath:             dbPath,
 		PID:                os.Getpid(),
@@ -1857,4 +1858,22 @@ func (h *Handler) handleAPIAgentStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"stats": stats, "count": len(stats)})
+}
+
+// gitDescribe returns a best-effort version string.
+// It prefers:
+//  1) AGENT_QUEUE_VERSION env var (set at build/deploy time)
+//  2) output of `git describe --tags --always` (when .git is present)
+//  3) "unknown"
+func gitDescribe() string {
+	if v := os.Getenv("AGENT_QUEUE_VERSION"); v != "" {
+		return v
+	}
+	cmd := exec.Command("git", "describe", "--tags", "--always")
+	cmd.Dir = "."
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
 }
