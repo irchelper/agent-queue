@@ -325,7 +325,8 @@ func (h *Handler) checkAgentTimeouts() {
 		// agent_timeout failures always surface to CEO for visibility; retry_routing
 		// is intentionally NOT queried here to avoid masking timeout patterns.
 		if h.sessionN != nil {
-			failedTask.FailureReason = reason
+			trace := h.buildAlertTrace(failedTask, &timeoutMinutes, "agent_timeout bypass")
+			failedTask.FailureReason = reason + "\n" + trace
 			go h.sessionN.OnFailed(failedTask)
 		}
 	}
@@ -356,6 +357,56 @@ func (h *Handler) advanceHumanTask(task model.Task, targetStatus model.Status, r
 	r := result
 	_, _, err = h.store.PatchTask(task.ID, model.PatchTaskRequest{Status: &targetStatus, Result: &r, Version: ver, ChangedBy: "system"})
 	return err
+}
+
+// buildAlertTrace assembles a compact, self-contained trace block for CEO alerts.
+// timeoutMinutes: pass nil when not applicable.
+func (h *Handler) buildAlertTrace(task model.Task, timeoutMinutes *int, routeReason string) string {
+	startedAt := "(nil)"
+	if task.StartedAt != nil {
+		startedAt = task.StartedAt.UTC().Format(time.RFC3339)
+	}
+	timeoutInfo := "n/a"
+	if timeoutMinutes != nil && task.StartedAt != nil {
+		deadline := task.StartedAt.Add(time.Duration(*timeoutMinutes) * time.Minute)
+		timeoutInfo = fmt.Sprintf("%dmin @ %s", *timeoutMinutes, deadline.UTC().Format(time.RFC3339))
+	}
+
+	// retry_routing matched rule (best-effort for display only).
+	routeText := "none"
+	if task.AssignedTo != "" {
+		if rule, err := h.store.GetRetryRouteMatch(task.AssignedTo, task.FailureReason); err == nil && rule != nil {
+			routeText = fmt.Sprintf("assigned_to=%s | keyword=%q → %s | priority=%d",
+				rule.AssignedTo, rule.ErrorKeyword, rule.RetryAssignedTo, rule.Priority)
+		}
+	}
+
+	histText := "(none)"
+	if items, err := h.store.GetHistory(task.ID); err == nil && len(items) > 0 {
+		start := 0
+		if len(items) > 3 {
+			start = len(items) - 3
+		}
+		lines := make([]string, 0, len(items)-start)
+		for _, h := range items[start:] {
+			from := h.FromStatus
+			if from == "" {
+				from = "∅"
+			}
+			note := h.Note
+			if note != "" {
+				note = " | " + note
+			}
+			lines = append(lines, fmt.Sprintf("- %s %s→%s by %s%s",
+				h.ChangedAt.UTC().Format(time.RFC3339), from, h.ToStatus, h.ChangedBy, note))
+		}
+		histText = strings.Join(lines, "\n")
+	}
+
+	return fmt.Sprintf(
+		"trace:\n- original_task_id: %s\n- title: %s\n- assigned_to: %s\n- started_at: %s\n- timeout: %s\n- matched_rule: %s\n- route_reason: %s\n- recent_history:\n%s",
+		task.ID, task.Title, task.AssignedTo, startedAt, timeoutInfo, routeText, routeReason, histText,
+	)
 }
 
 // envDuration reads an environment variable as a duration; falls back to def.
@@ -1003,6 +1054,16 @@ func (h *Handler) handleFailedTask(task model.Task) {
 			h.autoRetry(task, retryAgent)
 		} else {
 			if h.sessionN != nil {
+				reason := task.FailureReason
+				if reason == "" {
+					reason = task.Result
+				}
+				if reason == "" {
+					reason = "（无）"
+				}
+				// set base reason for routing match lookup
+				task.FailureReason = reason
+				task.FailureReason = reason + "\n" + h.buildAlertTrace(task, nil, "retry_routing none")
 				if err := h.sessionN.OnFailed(task); err != nil {
 					log.Printf("[handler] CEO notification failed for task %s: %v", task.ID, err)
 				}

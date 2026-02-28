@@ -977,6 +977,26 @@ func (s *Store) GetHistory(id string) ([]model.HistoryItem, error) {
 	return s.historyFor(id)
 }
 
+// GetRetryRouteMatch returns the highest-priority matching retry_routing rule.
+// Returns (nil, nil) when no rule matches.
+func (s *Store) GetRetryRouteMatch(assignedTo, result string) (*model.RetryRoute, error) {
+	var r model.RetryRoute
+	err := s.db.QueryRow(`
+		SELECT id, assigned_to, error_keyword, retry_assigned_to, priority
+		FROM retry_routing
+		WHERE assigned_to = ?
+		  AND (error_keyword = '' OR ? LIKE '%' || error_keyword || '%')
+		ORDER BY priority DESC
+		LIMIT 1`, assignedTo, result).Scan(&r.ID, &r.AssignedTo, &r.ErrorKeyword, &r.RetryAssignedTo, &r.Priority)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetRetryRouteMatch: %w", err)
+	}
+	return &r, nil
+}
+
 func (s *Store) historyFor(id string) ([]model.HistoryItem, error) {
 	rows, err := s.db.Query(`
 		SELECT id, task_id, from_status, to_status, changed_by, note, changed_at
