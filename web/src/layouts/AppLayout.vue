@@ -26,9 +26,8 @@ const navItems = computed(() => [
 
 function isActive(path: string) {
   if (path === '/') return route.path === '/'
-  // Exact match for leaf nav items (e.g. /goals/new, /goals, /kanban).
-  // Avoids /goals matching /goals/new and vice versa.
-  return route.path === path
+  // Exact match OR child path (path + '/') — avoids /goals matching /goals/new.
+  return route.path === path || route.path.startsWith(path + '/')
 }
 
 // V22: Mobile hamburger menu
