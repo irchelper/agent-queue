@@ -66,8 +66,21 @@ const humanTodos = computed(() =>
   ),
 )
 const exceptions = computed(() => store.data?.exceptions ?? [])
-const todoCount = computed(() => humanTodos.value.length)
+
+// V30-v2: Badge修复
+// 🙋 badge = assigned_to 有值且 status=pending 的任务数（等待人工处理）
+const todoCount = computed(() =>
+  (store.data?.todo ?? []).filter(t => t.assigned_to && t.status === 'pending').length
+)
+// 🔴 badge = status=blocked OR failed 的任务数（和 exceptions 对齐）
 const exceptionCount = computed(() => exceptions.value.length)
+
+// V30-v2: 异常列表限流 — 默认只展示最近5条
+const EXCEPTION_LIMIT = 5
+const showAllExceptions = ref(false)
+const visibleExceptions = computed(() =>
+  showAllExceptions.value ? exceptions.value : exceptions.value.slice(0, EXCEPTION_LIMIT)
+)
 
 // V29b TASK-B: classify exceptions into retryable vs needsHuman
 function isRetryable(task: Task): boolean {
@@ -75,8 +88,9 @@ function isRetryable(task: Task): boolean {
   return r.startsWith('agent_timeout') || r.startsWith('stale max')
 }
 
-const retryableExceptions = computed(() => exceptions.value.filter(isRetryable))
-const needsHumanExceptions = computed(() => exceptions.value.filter(t => !isRetryable(t)))
+// V30-v2: 分类从 visibleExceptions 派生，保持与限流同步
+const retryableExceptions = computed(() => visibleExceptions.value.filter(isRetryable))
+const needsHumanExceptions = computed(() => visibleExceptions.value.filter(t => !isRetryable(t)))
 
 // V29b TASK-B: agent pill filter + counts
 const agentFilter = ref<string | null>(null)
@@ -376,7 +390,6 @@ async function bulkAction(action: 'cancel' | 'reassign') {
         <div class="flex-1 overflow-y-auto p-4 space-y-3">
           <div v-if="loading && !store.data" class="text-center text-gray-600 py-12">{{ t('common.loading') }}</div>
           <div v-else-if="humanTodos.length === 0" class="text-center text-gray-600 py-12">
-            <div class="text-4xl mb-3">✨</div>
             <div class="text-sm">暂无待办</div>
           </div>
 
@@ -637,6 +650,20 @@ async function bulkAction(action: 'cancel' | 'reassign') {
               </div>
             </div>
           </template>
+
+          <!-- V30-v2: 查看全部按钮 -->
+          <div v-if="!showAllExceptions && exceptionCount > EXCEPTION_LIMIT" class="pt-2 pb-1">
+            <button
+              class="w-full text-xs py-2 rounded-lg border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 transition-colors"
+              @click="showAllExceptions = true"
+            >查看全部 {{ exceptionCount }} 条异常 ↓</button>
+          </div>
+          <div v-if="showAllExceptions && exceptionCount > EXCEPTION_LIMIT" class="pt-2 pb-1">
+            <button
+              class="w-full text-xs py-2 rounded-lg border border-gray-700 text-gray-500 hover:text-gray-300 transition-colors"
+              @click="showAllExceptions = false"
+            >收起（只显示最近 {{ EXCEPTION_LIMIT }} 条）↑</button>
+          </div>
         </div>
       </div>
     </div>

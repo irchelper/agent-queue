@@ -121,7 +121,16 @@ function segmentsFor(tasks: Task[]) {
     done:   t.status === 'done' || t.status === 'cancelled',
     human:  isHuman(t),
     status: t.status,
+    active: t.status === 'in_progress' || t.status === 'claimed',
   }))
+}
+
+// V30-v2: 进度条四色 class
+function segmentClass(seg: { status: string; done: boolean; active: boolean }): string {
+  if (seg.done)                   return 'bg-green-500'
+  if (seg.status === 'failed')    return 'bg-red-500'
+  if (seg.active)                 return 'bg-blue-500 animate-pulse'
+  return 'bg-gray-600'
 }
 </script>
 
@@ -188,19 +197,19 @@ function segmentsFor(tasks: Task[]) {
               >
                 <div class="flex-1 min-w-0">
                   <div class="flex items-center gap-2 mb-2">
-                    <h3 class="font-medium text-gray-100 text-sm truncate">{{ chainTitle(chain) }}</h3>
+                    <h3
+                      class="font-medium text-gray-100 text-sm max-w-[60%] truncate"
+                      :title="chainTitle(chain)"
+                    >{{ chainTitle(chain) }}</h3>
                     <span class="text-xs text-gray-500 shrink-0">{{ doneCount(chain.tasks) }}/{{ chain.tasks.length }}</span>
                   </div>
-                  <div class="flex gap-0.5 h-2 rounded-full overflow-hidden bg-gray-800">
+                  <!-- V30-v2: 进度条 h-2.5，gap-1，四色 -->
+                  <div class="flex gap-1 h-2.5 rounded-full overflow-hidden bg-gray-800">
                     <div
                       v-for="(seg, i) in segmentsFor(chain.tasks)"
                       :key="i"
                       class="flex-1 rounded-sm transition-all"
-                      :class="seg.done
-                        ? (seg.human ? 'bg-orange-400' : 'bg-blue-500')
-                        : seg.status === 'in_progress'
-                          ? (seg.human ? 'bg-orange-400/50' : 'bg-blue-500/50')
-                          : 'bg-gray-700'"
+                      :class="segmentClass(seg)"
                     />
                   </div>
                   <div class="flex items-center gap-3 mt-1.5 text-xs text-gray-600">

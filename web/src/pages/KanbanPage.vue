@@ -4,9 +4,11 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import AppLayout from '@/layouts/AppLayout.vue'
 import KeyboardHelpModal from '@/components/KeyboardHelpModal.vue'
+import Pagination from '@/components/Pagination.vue'
 import { usePolling } from '@/composables/usePolling'
 import { useSSE } from '@/composables/useSSE'
 import { useKeyboardNav } from '@/composables/useKeyboardNav'
+import { usePagination } from '@/composables/usePagination'
 import { api } from '@/api/client'
 import type { Task, TaskStatus } from '@/types'
 
@@ -81,6 +83,12 @@ function isPendingApproval(task: Task): boolean {
   return task.assigned_to === 'human'
 }
 
+// V30-v2: done 列默认折叠
+const doneColumnCollapsed = ref(true)
+const doneTasks = computed(() => tasksByStatus.value['done'] ?? [])
+const { page: donePage, totalPages: doneTotalPages, total: doneTotal, items: doneTaskPage, goTo: doneGoTo } =
+  usePagination(() => doneTasks.value, 20)
+
 function cardClass(task: Task): string {
   if (isPendingApproval(task)) {
     return 'bg-gray-800 border border-amber-500/50 rounded-lg p-3 cursor-pointer hover:border-amber-400 transition-colors ring-1 ring-amber-500/20'
@@ -120,46 +128,91 @@ function cardClass(task: Task): string {
         <div
           v-for="col in columns"
           :key="col.key"
-          class="bg-gray-900 border border-gray-800 rounded-xl flex-shrink-0 w-56 flex flex-col"
+          class="bg-gray-900 border border-gray-800 rounded-xl flex-shrink-0 flex flex-col"
+          :class="col.key === 'done' && doneColumnCollapsed ? 'w-36' : 'w-56'"
         >
           <!-- Column header -->
-          <div class="px-3 py-3 border-b border-gray-800 flex items-center justify-between">
+          <div
+            class="px-3 py-3 border-b border-gray-800 flex items-center justify-between"
+            :class="col.key === 'done' ? 'cursor-pointer hover:bg-gray-800/50 transition-colors' : ''"
+            @click="col.key === 'done' && (doneColumnCollapsed = !doneColumnCollapsed)"
+          >
             <span class="text-xs font-semibold" :class="col.color">{{ col.label }}</span>
-            <span class="text-xs text-gray-600 bg-gray-800 px-1.5 py-0.5 rounded-full">
-              {{ tasksByStatus[col.key]?.length ?? 0 }}
-            </span>
+            <div class="flex items-center gap-1.5">
+              <!-- V30-v2: done 列用绿色大号 badge -->
+              <span
+                class="text-xs font-bold px-1.5 py-0.5 rounded-full"
+                :class="col.key === 'done'
+                  ? 'bg-green-500/20 text-green-400 text-sm'
+                  : 'text-gray-600 bg-gray-800'"
+              >
+                {{ tasksByStatus[col.key]?.length ?? 0 }}
+              </span>
+              <!-- 折叠箭头 -->
+              <span v-if="col.key === 'done'" class="text-gray-500 text-xs transition-transform duration-200"
+                :class="doneColumnCollapsed ? '' : 'rotate-90'">›</span>
+            </div>
           </div>
 
-          <!-- Tasks -->
-          <div class="flex-1 overflow-y-auto p-2 space-y-2 max-h-[calc(100vh-200px)]">
-            <div
-              v-for="task in tasksByStatus[col.key]"
-              :key="task.id"
-              :data-keyboard-index="taskIndexMap[task.id]"
-              :class="[cardClass(task), kbIndex === taskIndexMap[task.id] ? 'ring-2 ring-blue-500' : '']"
-              @click="$router.push(`/tasks/${task.id}`)"
-            >
-              <!-- Human task badge -->
-              <div v-if="isPendingApproval(task)" class="flex items-center gap-1 mb-1.5">
-                <span class="text-xs text-amber-400 font-semibold">👤 {{ t('kanban.humanTask') }}</span>
-              </div>
-              <div class="text-xs font-medium text-gray-200 leading-snug mb-2 line-clamp-2">
-                {{ task.title }}
-              </div>
-              <div class="flex items-center justify-between gap-1">
-                <span
-                  class="text-xs px-1.5 py-0.5 rounded-md"
-                  :class="agentBadge(task.assigned_to)"
+          <!-- Tasks (done 列折叠时不渲染) -->
+          <template v-if="col.key !== 'done' || !doneColumnCollapsed">
+            <div class="flex-1 overflow-y-auto p-2 space-y-2 max-h-[calc(100vh-200px)]">
+              <template v-if="col.key === 'done'">
+                <!-- V30-v2: done 列分页 -->
+                <div
+                  v-for="task in doneTaskPage"
+                  :key="task.id"
+                  :data-keyboard-index="taskIndexMap[task.id]"
+                  :class="[cardClass(task), kbIndex === taskIndexMap[task.id] ? 'ring-2 ring-blue-500' : '']"
+                  @click="$router.push(`/tasks/${task.id}`)"
                 >
-                  {{ task.assigned_to === 'human' ? '👤' : '🤖' }} {{ task.assigned_to }}
-                </span>
-                <span class="text-xs text-gray-600">{{ relativeTime(task.updated_at) }}</span>
-              </div>
+                  <div class="text-xs font-medium text-gray-200 leading-snug mb-2 line-clamp-2">{{ task.title }}</div>
+                  <div class="flex items-center justify-between gap-1">
+                    <span class="text-xs px-1.5 py-0.5 rounded-md" :class="agentBadge(task.assigned_to)">
+                      {{ task.assigned_to === 'human' ? '👤' : '🤖' }} {{ task.assigned_to }}
+                    </span>
+                    <span class="text-xs text-gray-600">{{ relativeTime(task.updated_at) }}</span>
+                  </div>
+                </div>
+                <div v-if="!doneTotal" class="text-center py-6 text-gray-700 text-xs">空</div>
+                <Pagination
+                  :page="donePage"
+                  :total-pages="doneTotalPages"
+                  :total="doneTotal"
+                  @go="doneGoTo"
+                />
+              </template>
+              <template v-else>
+                <div
+                  v-for="task in tasksByStatus[col.key]"
+                  :key="task.id"
+                  :data-keyboard-index="taskIndexMap[task.id]"
+                  :class="[cardClass(task), kbIndex === taskIndexMap[task.id] ? 'ring-2 ring-blue-500' : '']"
+                  @click="$router.push(`/tasks/${task.id}`)"
+                >
+                  <!-- Human task badge -->
+                  <div v-if="isPendingApproval(task)" class="flex items-center gap-1 mb-1.5">
+                    <span class="text-xs text-amber-400 font-semibold">👤 {{ t('kanban.humanTask') }}</span>
+                  </div>
+                  <div class="text-xs font-medium text-gray-200 leading-snug mb-2 line-clamp-2">
+                    {{ task.title }}
+                  </div>
+                  <div class="flex items-center justify-between gap-1">
+                    <span
+                      class="text-xs px-1.5 py-0.5 rounded-md"
+                      :class="agentBadge(task.assigned_to)"
+                    >
+                      {{ task.assigned_to === 'human' ? '👤' : '🤖' }} {{ task.assigned_to }}
+                    </span>
+                    <span class="text-xs text-gray-600">{{ relativeTime(task.updated_at) }}</span>
+                  </div>
+                </div>
+                <div v-if="!tasksByStatus[col.key]?.length" class="text-center py-6 text-gray-700 text-xs">
+                  空
+                </div>
+              </template>
             </div>
-            <div v-if="!tasksByStatus[col.key]?.length" class="text-center py-6 text-gray-700 text-xs">
-              空
-            </div>
-          </div>
+          </template>
         </div>
       </div>
     </div>
