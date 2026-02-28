@@ -175,6 +175,9 @@ type ChainTaskSpec struct {
 	Description    string `json:"description"`
 	RequiresReview bool   `json:"requires_review"`
 	Priority       int    `json:"priority"`
+	// SpecFile is an optional path to a local file containing the full task spec.
+	// When set, the file contents are read server-side and prepended to Description.
+	SpecFile       string `json:"spec_file,omitempty"`
 }
 
 // ChainRequest is the body for POST /dispatch/chain.

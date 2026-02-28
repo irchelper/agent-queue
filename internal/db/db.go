@@ -229,6 +229,25 @@ func addRetryRoutingRules(db *sql.DB) error {
 		}
 	}
 
+	// V31-P0-3: coder spec 退单 → thinker（2026-02-28）
+	// coder 退单原因含 "spec" 时直接路由 thinker 补充规格
+	v31Rules := []struct {
+		assignedTo      string
+		errorKeyword    string
+		retryAssignedTo string
+		priority        int
+	}{
+		{"coder", "spec", "thinker", 10},
+	}
+	for _, r := range v31Rules {
+		_, err := db.Exec(
+			`INSERT OR IGNORE INTO retry_routing (assigned_to, error_keyword, retry_assigned_to, priority) VALUES (?, ?, ?, ?)`,
+			r.assignedTo, r.errorKeyword, r.retryAssignedTo, r.priority)
+		if err != nil {
+			return err
+		}
+	}
+
 	// V10.1 视觉验收 + PM/Ops 补全（2026-02-26）
 	v10Rules := []struct {
 		assignedTo      string

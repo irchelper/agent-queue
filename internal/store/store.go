@@ -377,6 +377,46 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 		}
 	}
 
+	// V31-P0-1: failed→done recovery — clean up orphan retry tasks.
+	// When a task recovers from failed to done (e.g. agent delivers result after timeout),
+	// any retry tasks spawned from it (superseded_by = this task's ID) are now redundant.
+	// Clear our own superseded_by and cancel pending/claimed orphan retry tasks.
+	if req.Status != nil && current.Status == model.StatusFailed && newStatus == model.StatusDone {
+		// 1. Clear this task's own superseded_by field (it is no longer superseded).
+		if _, err = tx.Exec(`UPDATE tasks SET superseded_by = '', updated_at = ? WHERE id = ?`, now, id); err != nil {
+			return model.Task{}, nil, fmt.Errorf("clear superseded_by: %w", err)
+		}
+		// 2. Find pending/claimed retry tasks that point to this task as their originator.
+		orphanRows, oErr := tx.Query(
+			`SELECT id FROM tasks WHERE superseded_by = ? AND status IN ('pending', 'claimed')`, id)
+		if oErr != nil {
+			return model.Task{}, nil, fmt.Errorf("find orphan retries: %w", oErr)
+		}
+		var orphanIDs []string
+		for orphanRows.Next() {
+			var oid string
+			if sErr := orphanRows.Scan(&oid); sErr != nil {
+				orphanRows.Close() //nolint:errcheck
+				return model.Task{}, nil, sErr
+			}
+			orphanIDs = append(orphanIDs, oid)
+		}
+		orphanRows.Close() //nolint:errcheck
+		// 3. Cancel each orphan + record history.
+		for _, oid := range orphanIDs {
+			if _, err = tx.Exec(
+				`UPDATE tasks SET status = 'cancelled', superseded_by = '', updated_at = ? WHERE id = ?`, now, oid); err != nil {
+				return model.Task{}, nil, fmt.Errorf("cancel orphan %s: %w", oid, err)
+			}
+			if _, err = tx.Exec(`
+				INSERT INTO task_history (task_id, from_status, to_status, changed_by, note, changed_at)
+				VALUES (?, 'pending', 'cancelled', 'system', 'orphan retry cancelled: original task recovered', ?)`,
+				oid, now); err != nil {
+				return model.Task{}, nil, fmt.Errorf("history orphan %s: %w", oid, err)
+			}
+		}
+	}
+
 	// F3: if task just became done, find tasks whose deps are now fully met.
 	var triggered []string
 	if newStatus == model.StatusDone {

@@ -547,12 +547,34 @@ func (h *Handler) handleDispatchChain(w http.ResponseWriter, r *http.Request) {
 		if i > 0 {
 			dependsOn = []string{created[i-1].ID}
 		}
+
+		// V31-P0-2: spec_file support for chain tasks (same logic as handleDispatch).
+		description := spec.Description
+		if sfPath := strings.TrimSpace(spec.SpecFile); sfPath != "" {
+			if strings.HasPrefix(sfPath, "~/") {
+				if home, herr := os.UserHomeDir(); herr == nil {
+					sfPath = filepath.Join(home, sfPath[2:])
+				}
+			}
+			sfContent, sfErr := os.ReadFile(sfPath)
+			if sfErr != nil {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("tasks[%d].spec_file read error: %v", i, sfErr))
+				return
+			}
+			if description != "" {
+				description = string(sfContent) + "\n\n---\n" + description
+			} else {
+				description = string(sfContent)
+			}
+		}
+
 		task, err := h.store.CreateTask(model.CreateTaskRequest{
 			Title:               spec.Title,
 			AssignedTo:          spec.AssignedTo,
-			Description:         spec.Description,
+			Description:         description,
 			RequiresReview:      spec.RequiresReview,
 			Priority:            spec.Priority,
+			SpecFile:            spec.SpecFile,
 			DependsOn:           dependsOn,
 			ChainID:             chainID,
 			NotifyCEOOnComplete: req.NotifyCEOOnComplete,
