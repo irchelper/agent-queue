@@ -839,7 +839,19 @@ func (s *Store) Poll(assignedTo string) (*model.Task, error) {
 	rows.Close() //nolint:errcheck
 
 	// Phase 2: find the first task with all deps met (connection now free).
+	// Re-check status to filter out tasks that transitioned to a terminal state
+	// (cancelled/done/failed) between Phase 1 and now (race-condition guard).
 	for i := range candidates {
+		var currentStatus string
+		err := s.db.QueryRow(`SELECT status FROM tasks WHERE id = ?`, candidates[i].ID).Scan(&currentStatus)
+		if err != nil {
+			return nil, fmt.Errorf("poll status recheck %s: %w", candidates[i].ID, err)
+		}
+		if currentStatus != "pending" {
+			// Task transitioned away from pending (cancelled/done/failed/claimed/etc.) — skip.
+			continue
+		}
+
 		met, err := s.depsMetForID(candidates[i].ID)
 		if err != nil {
 			return nil, err
