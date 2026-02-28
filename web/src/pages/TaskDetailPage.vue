@@ -12,6 +12,7 @@ const history = ref<TaskHistory[]>([])
 const chainTasks = ref<Task[]>([])
 const loading = ref(true)
 const error = ref<string | null>(null)
+const showRawJson = ref(false)
 
 async function load() {
   loading.value = true
@@ -539,6 +540,20 @@ async function submitComment() {
               <span v-else>💬 发送</span>
             </button>
           </div>
+        </div>
+      </div>
+
+      <!-- Raw JSON (collapsible debug panel) -->
+      <div v-if="task" class="mt-4">
+        <button
+          class="flex items-center gap-1.5 text-xs text-gray-600 hover:text-gray-400 transition-colors"
+          @click="showRawJson = !showRawJson"
+        >
+          <span class="font-mono">{{ showRawJson ? '▾' : '▸' }}</span>
+          原始 JSON
+        </button>
+        <div v-if="showRawJson" class="mt-2 bg-gray-900 border border-gray-700/60 rounded-xl p-4 overflow-x-auto">
+          <pre class="text-xs text-gray-400 font-mono leading-relaxed whitespace-pre">{{ JSON.stringify(task, null, 2) }}</pre>
         </div>
       </div>
     </div>
