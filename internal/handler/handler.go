@@ -320,12 +320,12 @@ func (h *Handler) checkAgentTimeouts() {
 			continue
 		}
 
-		// Notify CEO via SessionNotifier (same path as handleFailedTask)
+		// Notify CEO via SessionNotifier (same path as handleFailedTask without retry).
+		// agent_timeout failures always surface to CEO for visibility; retry_routing
+		// is intentionally NOT queried here to avoid masking timeout patterns.
 		if h.sessionN != nil {
 			failedTask.FailureReason = reason
-			if err := h.sessionN.OnFailed(failedTask); err != nil {
-				log.Printf("[agent_timeout] OnFailed notification for %s: %v", failedTask.ID, err)
-			}
+			go h.sessionN.OnFailed(failedTask)
 		}
 	}
 }
@@ -960,15 +960,20 @@ func (h *Handler) handleFailedTask(task model.Task) {
 		if isTestTask(task) {
 			return
 		}
-		// V31-P0: autoRetry depth cap (retry/fix/re-review) >= 3 → stop and alert CEO.
+		// V31-P0: autoRetry depth cap (retry/fix/re-review) >= 3 → stop.
+		// Auto-cancel the failed task (chain is system-digestible, no CEO alert needed —
+		// CEO already knows the 3-level rule; only genuine business failures notify CEO).
 		retryDepth := strings.Count(task.Title, "retry:") + strings.Count(task.Title, "fix:") + strings.Count(task.Title, "re-review:")
 		if retryDepth >= 3 {
-			if h.sessionN != nil {
-				blocked := task
-				blocked.FailureReason = "任务 retry 已达3级上限，需CEO介入"
-				if err := h.sessionN.OnFailed(blocked); err != nil {
-					log.Printf("[handler] retry depth cap OnFailed for %s: %v", task.ID, err)
-				}
+			log.Printf("[handler] retry depth cap reached for task %s (%s) – auto-cancelling, no CEO alert", task.ID, task.Title)
+			cancelStatus := model.StatusCancelled
+			if _, _, err := h.store.PatchTask(task.ID, model.PatchTaskRequest{
+				Status:    &cancelStatus,
+				ChangedBy: "system",
+				Version:   task.Version,
+				Note:      "auto-cancelled: retry depth ≥3, system-digestible failure",
+			}); err != nil {
+				log.Printf("[handler] retry depth cap auto-cancel %s failed: %v", task.ID, err)
 			}
 			return
 		}
