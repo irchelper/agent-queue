@@ -231,6 +231,7 @@ func addRetryRoutingRules(db *sql.DB) error {
 
 	// V31-P0-3: coder spec 退单 → thinker（2026-02-28）
 	// coder 退单原因含 "spec" 时直接路由 thinker 补充规格
+	// V31-P0-4: coder agent_timeout → coder（自重试，不走 catch-all）
 	v31Rules := []struct {
 		assignedTo      string
 		errorKeyword    string
@@ -238,6 +239,7 @@ func addRetryRoutingRules(db *sql.DB) error {
 		priority        int
 	}{
 		{"coder", "spec", "thinker", 10},
+		{"coder", "agent_timeout", "coder", 10},
 	}
 	for _, r := range v31Rules {
 		_, err := db.Exec(

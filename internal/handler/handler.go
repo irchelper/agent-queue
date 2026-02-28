@@ -964,6 +964,18 @@ func (h *Handler) handleFailedTask(task model.Task) {
 		if isTestTask(task) {
 			return
 		}
+		// V31-P0: autoRetry depth cap (retry/fix/re-review) >= 3 → stop and alert CEO.
+		retryDepth := strings.Count(task.Title, "retry:") + strings.Count(task.Title, "fix:") + strings.Count(task.Title, "re-review:")
+		if retryDepth >= 3 {
+			if h.sessionN != nil {
+				blocked := task
+				blocked.FailureReason = "任务 retry 已达3级上限，需CEO介入"
+				if err := h.sessionN.OnFailed(blocked); err != nil {
+					log.Printf("[handler] retry depth cap OnFailed for %s: %v", task.ID, err)
+				}
+			}
+			return
+		}
 		// Priority 1: explicit retry_assigned_to field.
 		retryAgent := task.RetryAssignedTo
 		// Priority 2: inline result format (legacy/expert shorthand).
