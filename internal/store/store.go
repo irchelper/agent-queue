@@ -379,10 +379,10 @@ func (s *Store) PatchTask(id string, req model.PatchTaskRequest) (model.Task, []
 
 	// V31-P1-C: failed→done permission check.
 	// Only the original assignee or "system" may recover a failed task to done.
-	// Empty changed_by is treated as anonymous and is also rejected.
+	// Empty changed_by is always rejected (anonymous calls are not permitted).
 	if req.Status != nil && current.Status == model.StatusFailed && newStatus == model.StatusDone {
 		caller := req.ChangedBy
-		if caller != "system" && caller != current.AssignedTo {
+		if caller == "" || (caller != "system" && caller != current.AssignedTo) {
 			return model.Task{}, nil, &ValidationError{
 				Msg: fmt.Sprintf("failed→done only allowed for original assignee (%s) or system, got %q",
 					current.AssignedTo, caller),
