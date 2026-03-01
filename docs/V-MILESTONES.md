@@ -15,8 +15,10 @@ This document provides a concise, high-level summary of notable features by vers
 - **V2 (MVP: F1–F6)** — Core task queue MVP implemented (create/dispatch/poll, basic workflow).
 - **V3 (macOS launchd deploy)** — Service deployment via launchd, environment variables wiring.
 - **V4 (Docs baseline)** — Initial `docs/ARCH.md`, `docs/PRD.md`, `docs/INTRO.md` added.
-- **V5 (Notifications)** — Richer webhook messages (duration/format) for better observability.
-- **V6 (Stability hardening)** — DB persistence and notification refinements.
+- **V5 (Failed + auto-retry + session notifications)** — Introduced `failed` state with `retry_assigned_to`, basic auto-retry wiring, and `SessionNotifier` for waking experts/CEO.
+  - Key commits: `505a6a2`, `5689cc2`
+- **V6 (Operational hardening on top of V5)** — Focused on persistence and production-ready notifications: DB persistence, simplified message formats, and dual-push for failed alerts (Discord + SessionNotifier).
+  - Key commit: `7610e5e`
 
 ### Commit range
 
@@ -45,6 +47,12 @@ This document provides a concise, high-level summary of notable features by vers
 ### Feature summary
 
 - **Config version bump** — `/api/config` version bumped to `v28`.
+- **Badge semantics fixes** — Multiple badge-related adjustments and semantics alignment.
+  - Key commit: `e4d9281`
+- **Cleanup API improvements** — Test-task cleanup endpoint enhanced (e.g. `max_age` parameter).
+  - Key commit: `8990dba`
+- **Settings page enhancements** — Settings page info/UX improved alongside related admin changes.
+  - Key commit: `e4d9281`
 
 ### Commit range
 
