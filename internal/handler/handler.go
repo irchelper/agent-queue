@@ -1548,7 +1548,8 @@ func isTestTaskTitleAssignee(title, assignedTo string) bool {
 	lt := strings.ToLower(title)
 	la := strings.ToLower(assignedTo)
 	// assigned_to == "test" is an explicit test sentinel (case-insensitive).
-	return strings.Contains(lt, "[test]") || strings.HasPrefix(la, "e2e-") || la == "test"
+	// unknown-agent-* are synthetic agents used in regression/trace tests; treat as test tasks.
+	return strings.Contains(lt, "[test]") || strings.HasPrefix(la, "e2e-") || la == "test" || strings.HasPrefix(la, "unknown-agent-")
 }
 
 func isTestTask(t model.Task) bool {
