@@ -77,6 +77,12 @@ Go server V8 retry 路由优先级链：
 
 **autoRetry V8 行为（有 retry_assigned_to 时）：**
 
+**Key semantics (failed / retry / depth cap):**
+- `failed` is a **terminal** state for the original task record.
+- A retry is created as a **new task** (X") and linked via `superseded_by` (X.superseded_by = X").
+- `retry_assigned_to` (explicit field or parsed from `result`) is the trigger for creating the follow-up retry task automatically.
+- A **retry depth cap** is enforced to avoid infinite loops / notification spam; when exceeded, autoRetry stops and CEO is notified.
+
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 读取原任务 X 的 `depends_on` 列表 | 继承原依赖，让 retry 任务在链路中处于相同位置 |
