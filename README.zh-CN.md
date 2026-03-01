@@ -6,6 +6,11 @@
 
 Agent 主动 poll 任务、原子认领、通过 HTTP 汇报完成。串行链全程自动推进：任务 A 完成后，任务 B 自动解锁，下一个 agent 在下次 poll 时认领执行，无需人工传递接力棒。
 
+术语对齐（与英文 README / PRD / ARCH 一致）：
+- **dispatch（单任务）**：`POST /dispatch` 创建单个任务并通知目标 agent session
+- **dispatch/chain（串行链）**：`POST /dispatch/chain` 一次创建 A→B→C 串行链，server 自动写入 `depends_on`
+- **poll（发现待领任务）**：agent 通过 `GET /tasks/poll?assigned_to=<agent>` 拉取待处理任务，然后 `POST /tasks/:id/claim` 原子认领，最后 `PATCH /tasks/:id` 回写状态/结果
+
 单二进制。零外部依赖。本机直接运行。
 
 ---
