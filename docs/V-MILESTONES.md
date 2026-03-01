@@ -7,7 +7,8 @@ This document provides a concise, high-level summary of notable features by vers
 
 ## V1–V6 (Early MVP)
 
-> TBD: feature summary consolidated from commits `d2730be..7610e5e`.
+> SubA (Bootstrapping / MVP) is covered by early commits `d2730be..40941ca` (<= 8 commits).
+> Remaining V1–V6 details can be expanded later from `d2730be..7610e5e`.
 
 ### Feature summary
 
@@ -22,9 +23,8 @@ This document provides a concise, high-level summary of notable features by vers
 
 ### Commit range
 
-- `d2730be` (Initial commit)
-- …
-- `7610e5e` (db persistence, simplified messages, failed Discord+SessionNotifier dual push)
+- `d2730be` → `40941ca` (SubA: bootstrap + MVP core)
+- TBD: expand the remaining V1–V6 range up to `7610e5e` once Batch-1 SubB/SubC backfill is completed.
 
 ## V26
 
