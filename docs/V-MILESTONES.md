@@ -7,6 +7,8 @@ This document provides a concise, high-level summary of notable features by vers
 
 ## V1–V6 (Early MVP)
 
+> SubA (bootstrapping/MVP) backfill reference (historical diff): `341bf6d..40941ca` (roots: `d2730be`, `0656c4b`).
+
 > SubA (Bootstrapping / MVP) is covered by early commits `d2730be..40941ca` (<= 8 commits).
 > Remaining V1–V6 details can be expanded later from `d2730be..7610e5e`.
 
