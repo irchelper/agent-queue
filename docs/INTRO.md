@@ -1,3 +1,11 @@
-# agent-queue
+# ainative
 
-轻量级 multi-agent 任务队列服务。用 SQLite 持久化任务状态，任何 AI agent 通过 HTTP 协调执行串行/并行任务——不依赖单一调度者在线，崩了也能从断点恢复。
+**ainative** is a lightweight task queue for coordinating multiple AI agents via HTTP.
+
+- **SQLite-backed**: task state is durable (no "lost context" when an agent/session crashes).
+- **Autonomous chaining**: dependencies unlock downstream tasks automatically.
+- **Local-first**: single binary, zero external dependencies.
+
+For the full architecture and API details, see:
+- `docs/ARCH.md`
+- `CHANGELOG.md`
