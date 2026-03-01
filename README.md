@@ -95,6 +95,7 @@ ainative moves task state out of agent memory and into SQLite. Any agent can cra
 
 - **Task queue** — Full CRUD with optimistic locking (`version` field); concurrent claim → 409 Conflict
 - **Dependency graph** — `depends_on` array; upstream `done` → downstream auto-unlocks
+  - V7+: `superseded_by` allows auto-retry to *replace* a failed task without breaking downstream dependencies (deps are satisfied by the superseding retry task).
 - **8-state machine** — `pending → claimed → in_progress → review → done / blocked / failed / cancelled`
 - **Atomic dispatch** — `POST /dispatch` creates task + wakes agent session in one call
 - **Serial chain dispatch** — `POST /dispatch/chain` creates a full chain with `depends_on` wired automatically
