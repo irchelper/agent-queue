@@ -321,6 +321,11 @@ type Notifier interface {
 
 ### F7: POST /dispatch（原子化派发接口）
 
+**API positioning (dispatch vs chain vs poll):**
+- **Single task**: use `POST /dispatch` to create the task and notify the target agent.
+- **Serial workflow**: use `POST /dispatch/chain` to create an A→B→C chain (server wires `depends_on`).
+- **Execution trigger**: agents run on a pull model via `GET /tasks/poll?assigned_to=<agent>` (then `POST /tasks/:id/claim` and `PATCH /tasks/:id`).
+
 | 功能 | 描述 | 优先级 |
 |------|------|--------|
 | 原子派发 | 一步完成"建任务 + 触发专家 session"，替代 POST /tasks + sessions_send 两步 | P0 |
