@@ -263,7 +263,9 @@ func (h *Handler) checkHumanTimeouts() {
 // transitions to failed if updated_at exceeds the effective timeout threshold.
 //
 // V27-A P0-1: use updated_at instead of started_at so that active agents
-//   (which call PATCH to report progress) are not killed mid-execution.
+//
+//	(which call PATCH to report progress) are not killed mid-execution.
+//
 // V27-A P0-2: per-task timeout_minutes takes priority over global agentTimeoutMinutes.
 func (h *Handler) checkAgentTimeouts() {
 	if h.agentTimeoutMinutes <= 0 {
@@ -1192,9 +1194,11 @@ func (h *Handler) handleFailedTask(task model.Task) {
 // autoRetry creates retry task(s) for the retry agent and dispatches.
 // V7: retry task inherits original.DependsOn; original.superseded_by is set to retry task ID.
 // V10: if the original task was assigned to a reviewer (thinker/security) and the retry
-//      agent is different, a two-stage chain is created:
-//      fix task (retryAgent) → re-review task (original.AssignedTo)
-//      superseded_by points to the re-review task so downstream deps wait for re-approval.
+//
+//	agent is different, a two-stage chain is created:
+//	fix task (retryAgent) → re-review task (original.AssignedTo)
+//	superseded_by points to the re-review task so downstream deps wait for re-approval.
+//
 // Per spec: does NOT notify CEO.
 func (h *Handler) autoRetry(original model.Task, retryAgent string) {
 	failureDesc := original.FailureReason
@@ -1261,7 +1265,7 @@ func (h *Handler) autoRetryReviewReject(original, origDetail model.Task, retryAg
 		AssignedTo:          retryAgent,
 		Priority:            original.Priority,
 		Description:         "审核退单修改意见:\n" + failureDesc,
-		DependsOn:           origDetail.DependsOn,           // inherit original reviewer's deps (e.g. C1)
+		DependsOn:           origDetail.DependsOn, // inherit original reviewer's deps (e.g. C1)
 		ChainID:             origDetail.ChainID,
 		NotifyCEOOnComplete: origDetail.NotifyCEOOnComplete,
 	})
@@ -1549,11 +1553,29 @@ func isTestTaskTitleAssignee(title, assignedTo string) bool {
 	la := strings.ToLower(assignedTo)
 	// assigned_to == "test" is an explicit test sentinel (case-insensitive).
 	// unknown-agent-* are synthetic agents used in regression/trace tests; treat as test tasks.
-	return strings.Contains(lt, "[test]") || strings.HasPrefix(la, "e2e-") || la == "test" || strings.HasPrefix(la, "unknown-agent-")
+	return strings.Contains(lt, "[test]") || strings.HasPrefix(la, "e2e-") || la == "test"
+}
+
+// isExplicitTestUnknownAgent returns true if an unknown-agent-* task is explicitly marked as test.
+// This avoids silently masking real routing bugs that accidentally produce unknown-agent assignees.
+func isExplicitTestUnknownAgent(t model.Task) bool {
+	la := strings.ToLower(strings.TrimSpace(t.AssignedTo))
+	if !strings.HasPrefix(la, "unknown-agent-") {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(t.FailureReason), "test") {
+		return true
+	}
+	lt := strings.ToLower(t.Title)
+	return strings.Contains(lt, "[test]") || strings.Contains(lt, "trace payload test")
 }
 
 func isTestTask(t model.Task) bool {
 	if isTestTaskTitleAssignee(t.Title, t.AssignedTo) {
+		return true
+	}
+	// Unknown-agent-* should only be silenced when explicitly marked as test.
+	if isExplicitTestUnknownAgent(t) {
 		return true
 	}
 	// B3: catch retry/fix/re-review chains from test-sourced failures.
@@ -2012,12 +2034,12 @@ func (h *Handler) handleAPIAgentStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type AgentStat struct {
-		Agent               string  `json:"agent"`
-		TotalTasks          int     `json:"total_tasks"`
-		DoneCount           int     `json:"done_count"`
-		FailedCount         int     `json:"failed_count"`
-		AvgDurationMinutes  float64 `json:"avg_duration_minutes"`
-		SuccessRate         float64 `json:"success_rate"` // done/(done+failed)*100
+		Agent              string  `json:"agent"`
+		TotalTasks         int     `json:"total_tasks"`
+		DoneCount          int     `json:"done_count"`
+		FailedCount        int     `json:"failed_count"`
+		AvgDurationMinutes float64 `json:"avg_duration_minutes"`
+		SuccessRate        float64 `json:"success_rate"` // done/(done+failed)*100
 	}
 
 	rows, err := h.db.QueryContext(r.Context(), `
@@ -2069,9 +2091,9 @@ func (h *Handler) handleAPIAgentStats(w http.ResponseWriter, r *http.Request) {
 
 // gitDescribe returns a best-effort version string.
 // It prefers:
-//  1) AGENT_QUEUE_VERSION env var (set at build/deploy time)
-//  2) output of `git describe --tags --always` (when .git is present)
-//  3) "unknown"
+//  1. AGENT_QUEUE_VERSION env var (set at build/deploy time)
+//  2. output of `git describe --tags --always` (when .git is present)
+//  3. "unknown"
 func gitDescribe() string {
 	if v := os.Getenv("AGENT_QUEUE_VERSION"); v != "" {
 		return v
